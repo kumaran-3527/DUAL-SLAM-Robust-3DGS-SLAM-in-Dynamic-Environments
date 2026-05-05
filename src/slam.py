@@ -203,7 +203,7 @@ class SLAM:
 
         # Regenerate feature extractor for non-keyframes
         self.traj_filler.setup_feature_extractor()
-        full_traj_eval(
+        traj_est_not_align, _, _ = full_traj_eval(
             self.traj_filler,
             self.mapper,
             f"{self.save_dir}/traj",
@@ -214,6 +214,11 @@ class SLAM:
             self.cfg['fast_mode'],
         )
 
+        try:
+            self.save_colmap_format(traj_est_not_align)
+        except Exception as e:
+            self.printer.print(f"Failed to save COLMAP format: {e}", FontColor.ERROR)
+
         self.mapper.gaussians.save_ply(f"{self.save_dir}/final_gs.ply")
 
         if self.cfg["mapping"]["uncertainty_params"]["activate"]:
@@ -223,6 +228,63 @@ class SLAM:
             )
 
         self.printer.print("Metrics Evaluation Done!", FontColor.EVAL)
+
+    def save_colmap_format(self, traj_est):
+        import shutil
+        from scipy.spatial.transform import Rotation
+        colmap_dir = os.path.join(self.save_dir, "colmap")
+        sparse_dir = os.path.join(colmap_dir, "sparse", "0")
+        images_dir = os.path.join(colmap_dir, "images")
+        
+        os.makedirs(sparse_dir, exist_ok=True)
+        os.makedirs(images_dir, exist_ok=True)
+        
+        # 1. cameras.txt
+        with open(os.path.join(sparse_dir, "cameras.txt"), "w") as f:
+            f.write("# Camera list with one line of data per camera:\n")
+            f.write("#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
+            f.write(f"1 PINHOLE {self.W} {self.H} {self.fx} {self.fy} {self.cx} {self.cy}\n")
+            
+        # 2. images.txt & Copy images
+        with open(os.path.join(sparse_dir, "images.txt"), "w") as f:
+            f.write("# Image list with two lines of data per image:\n")
+            f.write("#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
+            f.write("#   POINTS2D[] as (X, Y, POINT3D_ID)\n")
+            
+            for i, c2w in enumerate(traj_est):
+                w2c = np.linalg.inv(c2w)
+                R = w2c[:3, :3]
+                T = w2c[:3, 3]
+                quat = Rotation.from_matrix(R).as_quat() # x, y, z, w
+                qx, qy, qz, qw = quat[0], quat[1], quat[2], quat[3]
+                
+                if self.stream.color_paths and i < len(self.stream.color_paths):
+                    src_img_path = self.stream.color_paths[i]
+                    img_name = os.path.basename(src_img_path)
+                    dst_img_path = os.path.join(images_dir, img_name)
+                    if not os.path.exists(dst_img_path):
+                        shutil.copy(src_img_path, dst_img_path)
+                else:
+                    img_name = f"{i:05d}.png"
+                
+                f.write(f"{i+1} {qw} {qx} {qy} {qz} {T[0]} {T[1]} {T[2]} 1 {img_name}\n\n")
+                
+        # 3. points3D.txt
+        with open(os.path.join(sparse_dir, "points3D.txt"), "w") as f:
+            f.write("# 3D point list with one line of data per point:\n")
+            f.write("#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n")
+            
+            xyz = self.mapper.gaussians.get_xyz.detach().cpu().numpy()
+            features = self.mapper.gaussians.get_features.detach().cpu().numpy()
+            f_dc = features[:, 0, :]
+            SH0 = 0.28209479177387814
+            colors = np.clip(f_dc * SH0 + 0.5, 0, 1) * 255
+            colors = colors.astype(np.uint8)
+            
+            for i in range(xyz.shape[0]):
+                f.write(f"{i+1} {xyz[i,0]} {xyz[i,1]} {xyz[i,2]} {colors[i,0]} {colors[i,1]} {colors[i,2]} 0.0\n")
+
+        self.printer.print(f"Saved COLMAP format in {colmap_dir}!", FontColor.INFO)
 
     def _eval_depth_all(self, ate_statistics, global_scale, r_a, t_a):
         """From Splat-SLAM. Not used in WildGS-SLAM evaluation, but might be useful in the future."""

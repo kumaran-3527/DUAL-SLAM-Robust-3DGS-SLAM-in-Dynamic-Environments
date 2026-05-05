@@ -391,3 +391,96 @@ def compute_dino_regularization_loss(
 def _ensure_tensor(buffer: Union[torch.Tensor, List[torch.Tensor]]) -> torch.Tensor:
     """Convert list of tensors to single tensor if needed."""
     return torch.stack(buffer) if isinstance(buffer, list) else buffer
+
+
+def propagate_uncertainty_via_dino_similarity(
+    uncertainty: torch.Tensor,
+    features: torch.Tensor,
+    k: int = 8,
+    sim_threshold: float = 0.75,
+    dynamic_threshold: float = 0.5,
+    spatial_sigma: float = 10.0,
+) -> torch.Tensor:
+    """
+    Post-process per-patch uncertainty by propagating high-uncertainty values to
+    semantically similar, spatially-proximate patches within the same frame.
+
+    Motivation: the MLP labels patches independently, so a single flagged patch on
+    a moving object does not automatically raise uncertainty on the rest of that
+    object. This function diffuses dynamism across same-instance patches via DINOv2
+    cosine similarity weighted by spatial proximity, so that one clearly dynamic
+    patch promotes the whole object without contaminating visually similar but
+    distant objects (e.g. a different car further away in the scene).
+
+    The operation is non-parametric and runs after MLP inference; it only ever
+    raises uncertainty values, never lowers them.
+
+    Expected input space: processed MLP output after
+        ``torch.clip(mlp_out, min=0.1) + 1e-3``
+    so the floor is ~0.101 (static) and larger values indicate higher dynamism.
+
+    Args:
+        uncertainty:       Per-patch uncertainty for one frame  [H', W'].
+        features:          DINOv2 patch features, same spatial grid  [H', W', C].
+        k:                 Number of nearest neighbours queried per patch.
+        sim_threshold:     Threshold on the combined (cosine × spatial) similarity
+                           score below which a neighbour's contribution is ignored.
+        dynamic_threshold: Uncertainty value above which a patch is considered
+                           dynamic and eligible to propagate to its neighbours.
+        spatial_sigma:     Gaussian spatial-falloff width in patch units.
+                           Limits propagation to spatially nearby patches, preventing
+                           cross-instance contamination for visually similar objects.
+
+    Returns:
+        Updated uncertainty map  [H', W'] with values >= input uncertainty.
+    """
+    H, W = uncertainty.shape
+    N = H * W
+    device = uncertainty.device
+
+    # ── Appearance similarity ─────────────────────────────────────────────────
+    feats_flat = features.reshape(N, features.shape[-1])      # [N, C]
+    feats_norm = F.normalize(feats_flat, p=2, dim=-1)          # [N, C]
+    sim = torch.matmul(feats_norm, feats_norm.T)               # [N, N]
+
+    # Top-K by cosine similarity; k+1 so we can drop the self-match at rank 0
+    k_clamped = min(k + 1, N)
+    topk_sims, topk_idx = torch.topk(sim, k=k_clamped, dim=-1)  # [N, k+1]
+    topk_sims = topk_sims[:, 1:]   # [N, K]  — cosine sim to each neighbour
+    topk_idx  = topk_idx[:, 1:]    # [N, K]  — flat patch index of each neighbour
+
+    # ── Spatial proximity weighting ───────────────────────────────────────────
+    # Computed only for the K selected neighbours (O(N·K)), not the full N² grid.
+    arange = torch.arange(N, device=device)
+    src_row = (arange // W).float()                            # [N]
+    src_col = (arange %  W).float()                            # [N]
+
+    nbr_row = src_row[topk_idx]                                # [N, K]
+    nbr_col = src_col[topk_idx]                                # [N, K]
+
+    dist_sq = (src_row.unsqueeze(1) - nbr_row) ** 2 \
+            + (src_col.unsqueeze(1) - nbr_col) ** 2            # [N, K]
+    spatial_w = torch.exp(-dist_sq / (2.0 * spatial_sigma ** 2))  # [N, K]
+
+    # Combined score: penalises neighbours that are either dissimilar or distant
+    combined = topk_sims * spatial_w                           # [N, K]
+
+    # ── Propagation ───────────────────────────────────────────────────────────
+    valid = combined > sim_threshold                           # [N, K]
+
+    uncer_flat = uncertainty.reshape(N)                        # [N]
+    nbr_uncer  = uncer_flat[topk_idx]                          # [N, K]
+
+    # A neighbour can only donate uncertainty if it is itself above the dynamic
+    # threshold — prevents cascading from noise in static regions.
+    source_mask = (nbr_uncer > dynamic_threshold) & valid      # [N, K]
+
+    # Contribution: neighbour uncertainty scaled by combined similarity.
+    # The max over neighbours gives the strongest warranted increase.
+    contribution = nbr_uncer * combined * source_mask.float()  # [N, K]
+    max_contrib  = contribution.max(dim=-1).values             # [N]
+
+    # Raise each patch's uncertainty to at least the best inherited contribution.
+    updated = torch.maximum(uncer_flat, max_contrib)
+
+    return updated.reshape(H, W)

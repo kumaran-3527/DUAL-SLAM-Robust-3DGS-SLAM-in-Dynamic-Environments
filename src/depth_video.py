@@ -446,7 +446,7 @@ class DepthVideo:
         if not self.uncertainty_aware:
             # we only estimate uncertainty when we activate the mode
             raise Exception('This function should not be called if uncertainty aware is not activated')
-        
+
         i = 0
         while i*20 < self.counter.value:
             dino_feat_batch = self.dino_feats[i*20:min((i+1)*20,self.counter.value),:,:,:].to(self.device)
@@ -457,6 +457,14 @@ class DepthVideo:
             h = self.images.shape[2]
             w = self.images.shape[3]
             uncer = torch.clip(uncer, min=0.1) + 1e-3
+
+            # Propagate high uncertainty to semantically similar, spatially nearby
+            # patches within each frame before upsampling to avoid resampling artifacts.
+            uncer = torch.stack([
+                map_utils.propagate_uncertainty_via_dino_similarity(uncer[b], dino_feat_batch[b])
+                for b in range(uncer.shape[0])
+            ])
+
             uncer = uncer.unsqueeze(1)
             uncer = F.interpolate(uncer, size=(h, w), mode="bilinear").squeeze(1).detach()
             data_rate = 1 + 1 * map_utils.compute_bias_factor(train_frac, 0.8)
@@ -467,11 +475,11 @@ class DepthVideo:
             i += 1
 
     @torch.no_grad()
-    def update_uncertainty_mask_given_index(self,idxs):
+    def update_uncertainty_mask_given_index(self, idxs):
         if not self.uncertainty_aware:
             # we only estimate uncertainty when we activate the mode
             raise Exception('This function should not be called if uncertainty aware is not activated')
-        
+
         dino_feat_batch = self.dino_feats[idxs,:,:,:].to(self.device)
         with Lock():
             uncer = self.uncer_network(dino_feat_batch)
@@ -480,6 +488,14 @@ class DepthVideo:
         h = self.images.shape[2]
         w = self.images.shape[3]
         uncer = torch.clip(uncer, min=0.1) + 1e-3
+
+        # Propagate high uncertainty to semantically similar, spatially nearby
+        # patches within each frame before upsampling to avoid resampling artifacts.
+        uncer = torch.stack([
+            map_utils.propagate_uncertainty_via_dino_similarity(uncer[b], dino_feat_batch[b])
+            for b in range(uncer.shape[0])
+        ])
+
         uncer = uncer.unsqueeze(1)
         uncer = torch.nn.functional.interpolate(uncer, size=(h, w), mode="bilinear").squeeze(1).detach()
         data_rate = 1 + 1 * map_utils.compute_bias_factor(train_frac, 0.8)
