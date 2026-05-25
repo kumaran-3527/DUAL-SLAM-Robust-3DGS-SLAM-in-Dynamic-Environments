@@ -153,7 +153,8 @@ def get_loss_mapping_uncertainty(
     train_frac: float,
     ssim_frac: float,
     initialization: bool = False,
-    freeze_uncertainty_loss: bool = False,  # Renamed parameter
+    freeze_uncertainty_loss: bool = False,
+    flow_residual_weight: Tensor = None,  # [H/8, W/8] normalised to [0,1]
 ) -> Tuple[Tensor, Tensor]:
     """Compute mapping loss with uncertainty estimation for SLAM system.
     
@@ -199,9 +200,15 @@ def get_loss_mapping_uncertainty(
     # Compute SSIM loss if enabled
     ssim_loss = 1.0 - ssim(rendered_img, gt_img) if config["Training"]["ssim_loss"] else 0.0
 
-    # Predict uncertainty from features
+    # Predict uncertainty from DINOv2 features.
+    # Note: flow_residual_weight and image_gradient are passed separately to
+    # uncertainty_network for computing the Mixture-of-Experts UKD loss.
     features = viewpoint.features.to(device=rendered_img.device)
-    uncertainty = uncertainty_network(features)
+    u_fast, _, u_max = uncertainty_network(
+        features, 
+        dino_warp_scores=flow_residual_weight, 
+        image_grad=viewpoint.grad_mask.to(features.device) if viewpoint.grad_mask is not None else None
+    )
 
      # Compute mapping losses with uncertainty
     uncer_loss, uncer_resized, l1_rgb, l1_depth = map_utils.compute_mapping_loss_components(
@@ -209,12 +216,14 @@ def get_loss_mapping_uncertainty(
         rendered_img,
         ref_depth,
         rendered_depth,
-        uncertainty,
+        u_fast,
+        u_max,
         opacity.view(*mask_shape),
         train_fraction=train_frac,
         ssim_fraction=ssim_frac,
         uncertainty_config=config["uncertainty_params"],
-        mask=rgb_pixel_mask
+        mask=rgb_pixel_mask,
+        flow_residual_weight=flow_residual_weight,
     )
 
     # Combine RGB losses
@@ -255,7 +264,7 @@ def get_loss_mapping_uncertainty(
         config["uncertainty_params"]["ssim_mult"] * uncer_loss.mean()
     )
 
-    return uncertainty, total_loss
+    return u_fast, total_loss
 
 def get_median_depth(depth, opacity=None, mask=None, return_std=False):
     depth = depth.detach().clone()

@@ -240,10 +240,16 @@ class SLAM_GUI:
         self.in_rgb_widget = gui.ImageWidget()
         self.in_depth_widget = gui.ImageWidget()
         self.in_uncertainty_widget = gui.ImageWidget()
+        self.in_uncertainty_stm_widget = gui.ImageWidget()
+        self.in_uncertainty_ltm_widget = gui.ImageWidget()
         tab_info.add_child(gui.Label("Input Color, Metric Depth, Estimated Uncertainty"))
         tab_info.add_child(self.in_rgb_widget)
         tab_info.add_child(self.in_depth_widget)
         tab_info.add_child(self.in_uncertainty_widget)
+        tab_info.add_child(gui.Label("STM Uncertainty (Mapping / Short-Term)"))
+        tab_info.add_child(self.in_uncertainty_stm_widget)
+        tab_info.add_child(gui.Label("LTM Uncertainty (Tracking / Long-Term)"))
+        tab_info.add_child(self.in_uncertainty_ltm_widget)
 
         tabs.add_tab("Info", tab_info)
         self.panel.add_child(tabs)
@@ -536,6 +542,19 @@ class SLAM_GUI:
             uncertainty = (uncertainty).byte().permute(1, 2, 0).contiguous().cpu().numpy()
             rgb = o3d.geometry.Image(uncertainty)
             self.in_uncertainty_widget.update_image(rgb)
+
+        def _render_uncertainty_to_widget(data, widget, max_val=2.0):
+            """Helper: colorize a numpy uncertainty map and push to an ImageWidget."""
+            if data is None:
+                return
+            colored = imgviz.depth2rgb(data, min_value=0, max_value=max_val, colormap="plasma")
+            colored = torch.from_numpy(colored)
+            colored = torch.permute(colored, (2, 0, 1)).float()
+            colored = colored.byte().permute(1, 2, 0).contiguous().cpu().numpy()
+            widget.update_image(o3d.geometry.Image(colored))
+
+        _render_uncertainty_to_widget(gaussian_packet.uncertainty_stm, self.in_uncertainty_stm_widget)
+        _render_uncertainty_to_widget(gaussian_packet.uncertainty_ltm, self.in_uncertainty_ltm_widget)
 
         if gaussian_packet.finish:
             Log("Received terminate signal", tag="GUI")

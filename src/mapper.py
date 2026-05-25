@@ -126,9 +126,14 @@ class Mapper(object):
         self.uncertainty_aware = self.uncer_params["activate"]
         if self.uncertainty_aware:
             self.uncer_network = uncer_network
+            # Fast MLP: base LR — reacts per-frame to kinematic signals.
+            # Slow MLP: 0.6x LR — consolidates conservatively into LTM.
+            base_lr = self.uncer_params["lr"]
             self.uncer_optimizer = torch.optim.Adam(
-                self.uncer_network.parameters(),
-                lr=self.uncer_params["lr"],
+                [
+                    {"params": self.uncer_network.net_fast.parameters(), "lr": base_lr * 1.0},
+                    {"params": self.uncer_network.net_slow.parameters(), "lr": base_lr * 0.6},
+                ],
                 weight_decay=self.uncer_params["weight_decay"],
             )
 
@@ -710,8 +715,10 @@ class Mapper(object):
         """
         viewpoint = self.cameras[video_idx]
         keyframes = [self.cameras[kf_idx] for kf_idx in self.current_window]
-        uncertainty_map = self.get_viewpoint_uncertainty_no_grad(viewpoint)
+        uncertainty_map, stm_map, ltm_map = self.get_viewpoint_uncertainty_no_grad(viewpoint)
         uncertainty_map = uncertainty_map.cpu().squeeze(0).numpy()
+        stm_map = stm_map.cpu().squeeze(0).numpy()
+        ltm_map = ltm_map.cpu().squeeze(0).numpy()
         
         current_window_dict = {}
         current_window_dict[self.current_window[0]] = self.current_window[1:]
@@ -725,6 +732,8 @@ class Mapper(object):
                 keyframes=keyframes,
                 kf_window=current_window_dict,
                 uncertainty=uncertainty_map,
+                uncertainty_stm=stm_map,
+                uncertainty_ltm=ltm_map,
             )
         )
 
@@ -836,7 +845,7 @@ class Mapper(object):
         # Using uncertainty only when uncertainty-aware tracking is activated
         if self.video.uncertainty_aware:
             with torch.no_grad():
-                uncer = self.uncer_network(features.to(color.device))
+                _, _, uncer = self.uncer_network(features.to(color.device))
                 uncer = torch.clip(uncer, min=0.1) + 1e-3
                 uncer_resized = F.interpolate(
                     uncer.unsqueeze(0).unsqueeze(0),
@@ -971,6 +980,11 @@ class Mapper(object):
                     depth = F.interpolate(
                         depth.unsqueeze(0), viewpoint.depth.shape, mode="bicubic"
                     ).squeeze(0)
+
+                # Fetch kinematic gate for this keyframe (bootstrapping fix)
+                _fr_weight = None
+                if hasattr(self.video, "dino_warp_scores"):
+                    _fr_weight = self.video.dino_warp_scores[viewpoint.uid].clone()
                 current_uncertainty, loss_init = get_loss_mapping_uncertainty(
                     self.config["mapping"],
                     image,
@@ -981,6 +995,7 @@ class Mapper(object):
                     train_frac,
                     ssim_frac,
                     initialization=True,
+                    flow_residual_weight=_fr_weight,
                 )
 
                 stride = self.config["mapping"]["uncertainty_params"]["reg_stride"]
@@ -995,6 +1010,8 @@ class Mapper(object):
                 ] * map_utils.compute_dino_regularization_loss(
                     uncer_buffer, feature_buffer
                 )
+                if hasattr(self.uncer_network, "distill_loss"):
+                    loss_init += 10.0 * self.uncer_network.distill_loss
 
             scaling = self.gaussians.get_scaling
             isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
@@ -1030,7 +1047,8 @@ class Mapper(object):
                 self.keyframe_optimizers.zero_grad(set_to_none=True)
                 if self.uncertainty_aware:
                     self.uncer_optimizer.step()
-                    self.uncer_optimizer.zero_grad()
+                    self.uncer_optimizer.zero_grad(set_to_none=True)
+
 
                 self.frame_count_log[kf_idx] += 1
 
@@ -1121,6 +1139,11 @@ class Mapper(object):
                 train_frac = self.uncer_params["train_frac_fix"]
                 ssim_frac = self.uncer_params["train_frac_fix"]
 
+
+                # Fetch kinematic gate for this keyframe (bootstrapping fix)
+                _fr_weight = None
+                if hasattr(self.video, "dino_warp_scores"):
+                    _fr_weight = self.video.dino_warp_scores[viewpoint_kf_idx_stack[cam_idx]].clone()
                 (
                     current_uncertainty,
                     current_loss_mapping,
@@ -1133,9 +1156,11 @@ class Mapper(object):
                     self.uncer_network,
                     train_frac,
                     ssim_frac,
-                    freeze_uncertainty_loss=self.iterations_after_densify_or_reset < 20,
+                    flow_residual_weight=_fr_weight,
                 )
                 loss_mapping += current_loss_mapping
+                if hasattr(self.uncer_network, "distill_loss"):
+                    loss_mapping += 10.0 * self.uncer_network.distill_loss
 
                 # Dino_regularization loss
                 if self.iterations_after_densify_or_reset >= 20:
@@ -1155,7 +1180,7 @@ class Mapper(object):
                     sampled_feature = feature_buffer[
                         torch.randperm(feature_buffer.shape[0])[:num_samples]
                     ].unsqueeze(0)
-                    sampled_uncer = self.uncer_network(sampled_feature)
+                    sampled_uncer, _, _ = self.uncer_network(sampled_feature)
                     loss_mapping += (
                         reg_multi
                         * map_utils.compute_dino_regularization_loss(
@@ -1216,7 +1241,8 @@ class Mapper(object):
                 self.keyframe_optimizers.zero_grad(set_to_none=True)
                 if self.uncertainty_aware:
                     self.uncer_optimizer.step()
-                    self.uncer_optimizer.zero_grad()
+                    self.uncer_optimizer.zero_grad(set_to_none=True)
+
 
             self.frame_count_log[viewpoint_kf_idx_stack[cam_idx]] += 1
 
@@ -1292,6 +1318,11 @@ class Mapper(object):
                 train_frac = self.uncer_params["train_frac_fix"]
                 ssim_frac = self.uncer_params["train_frac_fix"]
 
+
+                # Fetch kinematic gate for this keyframe (bootstrapping fix)
+                _fr_weight = None
+                if hasattr(self.video, "dino_warp_scores"):
+                    _fr_weight = self.video.dino_warp_scores[random_viewpoint_kf_idx_stack[rand_idx]].clone()
                 (
                     current_uncertainty,
                     loss_mapping_this_frame,
@@ -1304,10 +1335,11 @@ class Mapper(object):
                     self.uncer_network,
                     train_frac,
                     ssim_frac,
-                    freeze_uncertainty_loss=self.iterations_after_densify_or_reset
-                    < 200,
+                    flow_residual_weight=_fr_weight,
                 )
                 loss_mapping += loss_mapping_this_frame
+                if hasattr(self.uncer_network, "distill_loss"):
+                    loss_mapping += 10.0 * self.uncer_network.distill_loss
 
                 stride = self.config["mapping"]["uncertainty_params"]["reg_stride"]
                 uncer_buffer.append(
@@ -1334,7 +1366,7 @@ class Mapper(object):
                 sampled_feature = feature_buffer[
                     torch.randperm(feature_buffer.shape[0])[:num_samples]
                 ].unsqueeze(0)
-                sampled_uncer = self.uncer_network(sampled_feature)
+                sampled_uncer, _, _ = self.uncer_network(sampled_feature)
                 loss_mapping += reg_multi * map_utils.compute_dino_regularization_loss(
                     sampled_uncer, sampled_feature
                 )
@@ -1358,7 +1390,8 @@ class Mapper(object):
                 self.keyframe_optimizers.zero_grad(set_to_none=True)
                 if self.uncertainty_aware:
                     self.uncer_optimizer.step()
-                    self.uncer_optimizer.zero_grad()
+                    self.uncer_optimizer.zero_grad(set_to_none=True)
+
 
             for kf_idx in random_viewpoint_kf_idxs:
                 self.frame_count_log[kf_idx] += 1
@@ -1425,27 +1458,29 @@ class Mapper(object):
         return ssim_loss
 
     @torch.no_grad()
-    def get_viewpoint_uncertainty_no_grad(self, viewpoint: Camera) -> torch.Tensor:
+    def get_viewpoint_uncertainty_no_grad(self, viewpoint: Camera):
         """
         Compute the uncertainty for a given viewpoint without gradient computation.
+        Returns (combined, stm, ltm) all as resized, adjusted tensors.
         """
         features = viewpoint.features.to(self.device)
-        with Lock():
-            uncertainty = self.uncer_network(features)
-
-        # Process uncertainty values
-        uncertainty = torch.clip(uncertainty, min=0.1) + 1e-3
-        target_shape = (viewpoint.image_height, viewpoint.image_width)
-        uncertainty_resized = map_utils.resample_tensor_to_shape(
-            uncertainty, target_shape
-        )
-
-        # Apply data rate adjustment, the same as how we calculate the loss function
         train_frac = self.uncer_params["train_frac_fix"]
         data_rate = 1 + map_utils.compute_bias_factor(train_frac, 0.8)
-        uncertainty_adjusted = (uncertainty_resized - 0.1) * data_rate + 0.1
+        target_shape = (viewpoint.image_height, viewpoint.image_width)
 
-        return uncertainty_adjusted ** 2
+        def _process(raw):
+            raw = torch.clip(raw, min=0.1) + 1e-3
+            resized = map_utils.resample_tensor_to_shape(raw, target_shape)
+            adjusted = (resized - 0.1) * data_rate + 0.1
+            return adjusted ** 2
+
+        with Lock():
+            u_fast, u_slow, u_aligned_max = self.uncer_network(features)
+            stm = _process(u_fast)
+            ltm = _process(u_slow)
+            combined = _process(u_aligned_max)
+
+        return combined, stm, ltm
 
     @torch.no_grad()
     def save_fig_everything(self, keyframe_idx: int, plot_dir: str, suffix: str = "", depth_max: float = 10.0):
@@ -1498,7 +1533,7 @@ class Mapper(object):
         if self.uncertainty_aware:
             # Add plotting 2x4 grid with additional figures for uncertainty
             # Estimated uncertainty map
-            uncertainty_map = self.get_viewpoint_uncertainty_no_grad(viewpoint)
+            uncertainty_map, _, _ = self.get_viewpoint_uncertainty_no_grad(viewpoint)
             uncertainty_map = uncertainty_map.cpu().squeeze(0)
 
             # SSIM loss
@@ -1617,7 +1652,7 @@ class Mapper(object):
                     viewpoint = self.cameras[keyframe_idxs[idx]]
                     rgb = viewpoint.original_image.cpu().permute(1, 2, 0).numpy()
                     rgb = (rgb * 255.0).astype(np.uint8)
-                    uncer_resized = self.get_viewpoint_uncertainty_no_grad(viewpoint)
+                    uncer_resized, _, _ = self.get_viewpoint_uncertainty_no_grad(viewpoint)
                     uncer_resized = uncer_resized.cpu().squeeze(0)
 
                     axs[2 * i, j].imshow(rgb)

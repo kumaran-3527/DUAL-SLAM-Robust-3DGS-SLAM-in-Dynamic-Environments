@@ -209,12 +209,14 @@ def compute_mapping_loss_components(
     rendered_img: torch.Tensor,
     ref_depth: torch.Tensor,
     rendered_depth: torch.Tensor,
-    uncertainty: torch.Tensor,
+    uncertainty_fast: torch.Tensor,
+    uncertainty_max: torch.Tensor,
     opacity: torch.Tensor,
     train_fraction: float,
     ssim_fraction: float,
     uncertainty_config: dict,
     mask: Optional[torch.Tensor] = None,
+    flow_residual_weight: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute essential components for uncertainty-aware mapping loss.
@@ -233,12 +235,18 @@ def compute_mapping_loss_components(
         rendered_img: Rendered RGB image [C,H,W]
         ref_depth: Reference depth map [1,H,W] (from metric depth)
         rendered_depth: Rendered depth map [1,H,W]
-        uncertainty: Model's uncertainty estimates [H',W'] (downsampled due to dino)
+        uncertainty_fast: Model's instantaneous fast uncertainty estimates [H',W'] (downsampled due to dino)
+        uncertainty_max: Maximum of fast and slow uncertainty for robust weighting [H',W']
         opacity: Rendering opacity mask [1,H,W]
         train_fraction: Training progress (0-1) for adaptive weighting
         ssim_fraction: SSIM loss weight fraction
         uncertainty_config: Dictionary containing uncertainty estimation parameters
         mask: Optional visibility mask for loss computation [1,H,W]
+        flow_residual_weight: Optional per-patch weight in [0,1] derived from DROID-SLAM
+            flow residuals at the DINOv2 patch resolution [H',W']. When provided, the
+            SSIM-based uncertainty NLL loss is gated by this weight so that patches with
+            near-zero flow residual (static, even if currently unmapped) do not cause the
+            Fast MLP to incorrectly spike their uncertainty (bootstrapping fix).
     """
     # Initialize median pooling for SSIM
     median_filter = MedianPool2d(
@@ -263,9 +271,10 @@ def compute_mapping_loss_components(
     )
 
     # Process uncertainty values
-    processed_uncertainty = torch.clip(uncertainty, min=0.1) + 1e-3
+    processed_uncertainty = torch.clip(uncertainty_fast, min=0.1) + 1e-3
+    processed_max_uncertainty = torch.clip(uncertainty_max, min=0.1) + 1e-3
     resized_uncertainty = resample_tensor_to_shape(
-        processed_uncertainty.detach(), (h, w)
+        processed_max_uncertainty.detach(), (h, w)
     )
     # 0.8 is ssim_anneal, this number is directly taken from nerf-on-the-go
     data_rate = 1 + 1 * compute_bias_factor(train_fraction, 0.8)
@@ -273,7 +282,7 @@ def compute_mapping_loss_components(
 
     # Process opacity
     resized_opacity = opacity.detach().view((h, w))
-    small_opacity = resample_tensor_to_shape(resized_opacity, uncertainty.shape)
+    small_opacity = resample_tensor_to_shape(resized_opacity, uncertainty_fast.shape)
 
     # Compute SSIM-based loss
     # 0.8 is ssim_anneal, this number is directly taken from nerf-on-the-go
@@ -291,19 +300,31 @@ def compute_mapping_loss_components(
     )
 
     # Process SSIM loss for uncertainty computation
-    small_ssim_loss = resample_tensor_to_shape(ssim_loss.detach(), uncertainty.shape)
+    small_ssim_loss = resample_tensor_to_shape(ssim_loss.detach(), uncertainty_fast.shape)
     filtered_ssim_loss = (
         median_filter(small_ssim_loss.unsqueeze(0).unsqueeze(0)).squeeze(0).squeeze(0)
     )
 
+    # --- Bootstrapping fix: gate the uncertainty NLL loss with the flow residual.
+    # If a patch has low flow residual (it is geometrically static, even if GS renders
+    # it poorly because it is newly revealed), we suppress the uncertainty loss so the
+    # Fast MLP does not incorrectly treat it as a dynamic region.
+    if flow_residual_weight is not None:
+        # flow_residual_weight is in [0,1] at DINOv2 patch resolution [H',W']
+        kinematic_gate = resample_tensor_to_shape(
+            flow_residual_weight.detach().to(filtered_ssim_loss.device),
+            filtered_ssim_loss.shape,
+        )
+        filtered_ssim_loss = filtered_ssim_loss * kinematic_gate
+
     # Process depth loss for uncertainty computation
     small_depth_loss = resample_tensor_to_shape(
         torch.clip(depth_l1_loss.squeeze(), max=5.0).detach(),
-        uncertainty.shape,
+        uncertainty_fast.shape,
         "bicubic",
     )
     small_depth = resample_tensor_to_shape(
-        ref_depth.squeeze().detach(), uncertainty.shape, "bicubic"
+        ref_depth.squeeze().detach(), uncertainty_fast.shape, "bicubic"
     )
     # do not penalize far away pixels
     small_depth_loss[small_depth > depth_threshold] = 0.0
@@ -393,94 +414,3 @@ def _ensure_tensor(buffer: Union[torch.Tensor, List[torch.Tensor]]) -> torch.Ten
     return torch.stack(buffer) if isinstance(buffer, list) else buffer
 
 
-def propagate_uncertainty_via_dino_similarity(
-    uncertainty: torch.Tensor,
-    features: torch.Tensor,
-    k: int = 8,
-    sim_threshold: float = 0.75,
-    dynamic_threshold: float = 0.5,
-    spatial_sigma: float = 10.0,
-) -> torch.Tensor:
-    """
-    Post-process per-patch uncertainty by propagating high-uncertainty values to
-    semantically similar, spatially-proximate patches within the same frame.
-
-    Motivation: the MLP labels patches independently, so a single flagged patch on
-    a moving object does not automatically raise uncertainty on the rest of that
-    object. This function diffuses dynamism across same-instance patches via DINOv2
-    cosine similarity weighted by spatial proximity, so that one clearly dynamic
-    patch promotes the whole object without contaminating visually similar but
-    distant objects (e.g. a different car further away in the scene).
-
-    The operation is non-parametric and runs after MLP inference; it only ever
-    raises uncertainty values, never lowers them.
-
-    Expected input space: processed MLP output after
-        ``torch.clip(mlp_out, min=0.1) + 1e-3``
-    so the floor is ~0.101 (static) and larger values indicate higher dynamism.
-
-    Args:
-        uncertainty:       Per-patch uncertainty for one frame  [H', W'].
-        features:          DINOv2 patch features, same spatial grid  [H', W', C].
-        k:                 Number of nearest neighbours queried per patch.
-        sim_threshold:     Threshold on the combined (cosine × spatial) similarity
-                           score below which a neighbour's contribution is ignored.
-        dynamic_threshold: Uncertainty value above which a patch is considered
-                           dynamic and eligible to propagate to its neighbours.
-        spatial_sigma:     Gaussian spatial-falloff width in patch units.
-                           Limits propagation to spatially nearby patches, preventing
-                           cross-instance contamination for visually similar objects.
-
-    Returns:
-        Updated uncertainty map  [H', W'] with values >= input uncertainty.
-    """
-    H, W = uncertainty.shape
-    N = H * W
-    device = uncertainty.device
-
-    # ── Appearance similarity ─────────────────────────────────────────────────
-    feats_flat = features.reshape(N, features.shape[-1])      # [N, C]
-    feats_norm = F.normalize(feats_flat, p=2, dim=-1)          # [N, C]
-    sim = torch.matmul(feats_norm, feats_norm.T)               # [N, N]
-
-    # Top-K by cosine similarity; k+1 so we can drop the self-match at rank 0
-    k_clamped = min(k + 1, N)
-    topk_sims, topk_idx = torch.topk(sim, k=k_clamped, dim=-1)  # [N, k+1]
-    topk_sims = topk_sims[:, 1:]   # [N, K]  — cosine sim to each neighbour
-    topk_idx  = topk_idx[:, 1:]    # [N, K]  — flat patch index of each neighbour
-
-    # ── Spatial proximity weighting ───────────────────────────────────────────
-    # Computed only for the K selected neighbours (O(N·K)), not the full N² grid.
-    arange = torch.arange(N, device=device)
-    src_row = (arange // W).float()                            # [N]
-    src_col = (arange %  W).float()                            # [N]
-
-    nbr_row = src_row[topk_idx]                                # [N, K]
-    nbr_col = src_col[topk_idx]                                # [N, K]
-
-    dist_sq = (src_row.unsqueeze(1) - nbr_row) ** 2 \
-            + (src_col.unsqueeze(1) - nbr_col) ** 2            # [N, K]
-    spatial_w = torch.exp(-dist_sq / (2.0 * spatial_sigma ** 2))  # [N, K]
-
-    # Combined score: penalises neighbours that are either dissimilar or distant
-    combined = topk_sims * spatial_w                           # [N, K]
-
-    # ── Propagation ───────────────────────────────────────────────────────────
-    valid = combined > sim_threshold                           # [N, K]
-
-    uncer_flat = uncertainty.reshape(N)                        # [N]
-    nbr_uncer  = uncer_flat[topk_idx]                          # [N, K]
-
-    # A neighbour can only donate uncertainty if it is itself above the dynamic
-    # threshold — prevents cascading from noise in static regions.
-    source_mask = (nbr_uncer > dynamic_threshold) & valid      # [N, K]
-
-    # Contribution: neighbour uncertainty scaled by combined similarity.
-    # The max over neighbours gives the strongest warranted increase.
-    contribution = nbr_uncer * combined * source_mask.float()  # [N, K]
-    max_contrib  = contribution.max(dim=-1).values             # [N]
-
-    # Raise each patch's uncertainty to at least the best inherited contribution.
-    updated = torch.maximum(uncer_flat, max_contrib)
-
-    return updated.reshape(H, W)

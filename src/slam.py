@@ -203,7 +203,7 @@ class SLAM:
 
         # Regenerate feature extractor for non-keyframes
         self.traj_filler.setup_feature_extractor()
-        traj_est_not_align, _, _ = full_traj_eval(
+        traj_est_not_align, _, _, dino_feats = full_traj_eval(
             self.traj_filler,
             self.mapper,
             f"{self.save_dir}/traj",
@@ -214,10 +214,8 @@ class SLAM:
             self.cfg['fast_mode'],
         )
 
-        try:
-            self.save_colmap_format(traj_est_not_align)
-        except Exception as e:
-            self.printer.print(f"Failed to save COLMAP format: {e}", FontColor.ERROR)
+        if self.cfg["data"]["colmap"]["export"]:
+            self.save_colmap_format_kf_dynrm(traj_est_not_align, dino_feats, self.cfg["data"]["colmap"]["keyframe_only"])
 
         self.mapper.gaussians.save_ply(f"{self.save_dir}/final_gs.ply")
 
@@ -229,9 +227,16 @@ class SLAM:
 
         self.printer.print("Metrics Evaluation Done!", FontColor.EVAL)
 
-    def save_colmap_format(self, traj_est):
+    def save_colmap_format_kf_dynrm(self, traj_est, dino_feats=None, keyframe_only=True):
         import shutil
+        import cv2
+        import torch
+        import numpy as np
         from scipy.spatial.transform import Rotation
+        from src.utils.dyn_uncertainty import mapping_utils as map_utils
+        from thirdparty.gaussian_splatting.gaussian_renderer import render
+        from src.utils.camera_utils import Camera
+        
         colmap_dir = os.path.join(self.save_dir, "colmap")
         sparse_dir = os.path.join(colmap_dir, "sparse", "0")
         images_dir = os.path.join(colmap_dir, "images")
@@ -245,29 +250,64 @@ class SLAM:
             f.write("#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
             f.write(f"1 PINHOLE {self.W} {self.H} {self.fx} {self.fy} {self.cx} {self.cy}\n")
             
-        # 2. images.txt & Copy images
+        # 2. images.txt & Copy/Mask images
         with open(os.path.join(sparse_dir, "images.txt"), "w") as f:
             f.write("# Image list with two lines of data per image:\n")
             f.write("#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
             f.write("#   POINTS2D[] as (X, Y, POINT3D_ID)\n")
             
-            for i, c2w in enumerate(traj_est):
-                w2c = np.linalg.inv(c2w)
+            if keyframe_only:
+                indices_to_process = sorted(list(self.mapper.cameras.keys()))
+            else:
+                indices_to_process = range(len(traj_est))
+            
+            for colmap_img_id, idx in enumerate(indices_to_process):
+                if keyframe_only:
+                    viewpoint = self.mapper.cameras[idx]
+                    actual_frame_idx = int(self.video.timestamp[idx])
+                else:
+                    actual_frame_idx = idx
+                    # Create temporary camera for non-keyframe pose
+                    c2w = torch.from_numpy(traj_est[actual_frame_idx]).to(self.device).float()
+                    w2c = torch.linalg.inv(c2w)
+                    
+                    camera_data = {
+                        "idx": actual_frame_idx,
+                        "gt_color": torch.zeros((3, self.H, self.W), device=self.device),
+                        "est_depth": np.zeros((self.H, self.W)),
+                        "est_pose": w2c,
+                        "features": None,
+                    }
+                    
+                    viewpoint = Camera.init_from_dataset(
+                        self.mapper.frame_reader,
+                        camera_data,
+                        self.mapper.projection_matrix,
+                        full_resol=self.cfg["mapping"]["full_resolution"],
+                    )
+                    viewpoint.update_RT(w2c[:3, :3], w2c[:3, 3])
+
+                # Render the image from the Gaussian model
+                render_pkg = render(
+                    viewpoint, self.mapper.gaussians, self.mapper.pipeline_params, self.mapper.background
+                )
+                rendered_img = render_pkg["render"].detach() ## c,h,w
+                rendered_img = torch.clamp(rendered_img, 0.0, 1.0) ## c,h,w
+                img = (rendered_img.cpu().numpy().transpose((1, 2, 0)) * 255.0).astype(np.uint8) # h,w,c
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                
+                img_name = f"{actual_frame_idx:05d}.png"
+                dst_img_path = os.path.join(images_dir, img_name)
+                cv2.imwrite(dst_img_path, img)
+                
+                c2w = traj_est[actual_frame_idx] ## c2w is wrt camera frame/original frame
+                w2c = np.linalg.inv(c2w) ## w2c is wrt world frame/colmap frame
                 R = w2c[:3, :3]
                 T = w2c[:3, 3]
                 quat = Rotation.from_matrix(R).as_quat() # x, y, z, w
                 qx, qy, qz, qw = quat[0], quat[1], quat[2], quat[3]
                 
-                if self.stream.color_paths and i < len(self.stream.color_paths):
-                    src_img_path = self.stream.color_paths[i]
-                    img_name = os.path.basename(src_img_path)
-                    dst_img_path = os.path.join(images_dir, img_name)
-                    if not os.path.exists(dst_img_path):
-                        shutil.copy(src_img_path, dst_img_path)
-                else:
-                    img_name = f"{i:05d}.png"
-                
-                f.write(f"{i+1} {qw} {qx} {qy} {qz} {T[0]} {T[1]} {T[2]} 1 {img_name}\n\n")
+                f.write(f"{colmap_img_id+1} {qw} {qx} {qy} {qz} {T[0]} {T[1]} {T[2]} 1 {img_name}\n\n") 
                 
         # 3. points3D.txt
         with open(os.path.join(sparse_dir, "points3D.txt"), "w") as f:
@@ -285,6 +325,7 @@ class SLAM:
                 f.write(f"{i+1} {xyz[i,0]} {xyz[i,1]} {xyz[i,2]} {colors[i,0]} {colors[i,1]} {colors[i,2]} 0.0\n")
 
         self.printer.print(f"Saved COLMAP format in {colmap_dir}!", FontColor.INFO)
+
 
     def _eval_depth_all(self, ate_statistics, global_scale, r_a, t_a):
         """From Splat-SLAM. Not used in WildGS-SLAM evaluation, but might be useful in the future."""

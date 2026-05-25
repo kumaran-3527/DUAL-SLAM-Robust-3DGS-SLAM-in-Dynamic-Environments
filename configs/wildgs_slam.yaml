@@ -52,7 +52,7 @@ mapping:
     densification_interval: 100
     opacity_reset_interval: 3000
     densify_until_iter: 15000
-    densify_grad_threshold: 0.0002
+    densify_grad_threshold: 0.0004
 
   model_params:
     sh_degree: 0
@@ -150,6 +150,9 @@ mono_prior:
 
 data:
   output: ./output/wildgs_slam
+  colmap:
+    export: True
+    keyframe_only: False # True for keyframes only, False for all frames
   input_folder: Please_specify_the_path_to_the_dataset
 
 dataset: 'tumrgbd'

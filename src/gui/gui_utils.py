@@ -92,6 +92,8 @@ class GaussianPacket:
         gtcolor=None,
         gtdepth=None,
         uncertainty=None,
+        uncertainty_stm=None,
+        uncertainty_ltm=None,
         keyframes=None,
         finish=False,
         kf_window=None,
@@ -120,6 +122,8 @@ class GaussianPacket:
         self.gtcolor = self.resize_img(gtcolor, 320)
         self.gtdepth = self.resize_img(gtdepth, 320)
         self.uncertainty = self.resize_img(uncertainty, 320)
+        self.uncertainty_stm = self.resize_img(uncertainty_stm, 320)
+        self.uncertainty_ltm = self.resize_img(uncertainty_ltm, 320)
         self.keyframes = keyframes
         self.finish = finish
         self.kf_window = kf_window

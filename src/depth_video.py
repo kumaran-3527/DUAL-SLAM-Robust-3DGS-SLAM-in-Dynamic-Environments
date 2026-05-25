@@ -78,6 +78,9 @@ class DepthVideo:
             self.dino_feats = torch.zeros(buffer, ht//14, wd//14, n_features, device='cpu', dtype=torch.float).share_memory_()
             self.dino_feats_resize = torch.zeros(buffer, n_features, ht//self.down_scale, wd//self.down_scale, device='cpu', dtype=torch.float).share_memory_()
             self.uncertainties_inv = torch.ones(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
+            # DINOv2 warping Semantic Consistency Error (SCE) per keyframe at 1/8 resolution.
+            # Aggregated across all BA edges touching each frame during ba().
+            self.dino_warp_scores = torch.zeros(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
         else:
             self.dino_feats = None
             self.dino_feats_resize = None
@@ -372,6 +375,71 @@ class DepthVideo:
             
             self.disps.clamp_(min=1e-5)
 
+            # ── Semantic Consistency Error (SCE) via DINOv2 Warping ──
+            # After BA updates poses/disps, we warp the semantic DINOv2 features
+            # to check for rigid-semantic inconsistency. Moving objects violate 
+            # the static world assumption, causing high SCE at object boundaries.
+            if self.uncertainty_aware and not motion_only:
+                with torch.no_grad():
+                    # induced_coords: [1, E, H/8, W/8, 2] — where pixels in ii
+                    # land in jj under the current rigid pose + depth estimate.
+                    induced_coords, valid = pops.projective_transform(
+                        lietorch.SE3(self.poses[None]), self.disps[None],
+                        self.intrinsics[None], ii, jj
+                    )  # [1, E, H/8, W/8, 2]
+                    valid = valid[0, ..., 0] # [E, H/8, W/8]
+
+                    # Format induced_coords for grid_sample [-1, 1]
+                    if self.dino_feats_resize is not None:
+                        W_s = self.wd // self.down_scale
+                        H_s = self.ht // self.down_scale
+                        grid = induced_coords.squeeze(0).clone() # [E, H_s, W_s, 2]
+                        grid[..., 0] = 2.0 * grid[..., 0] / (W_s - 1) - 1.0
+                        grid[..., 1] = 2.0 * grid[..., 1] / (H_s - 1) - 1.0
+                        
+                        # Compute Semantic Consistency Error (SCE) in chunks to avoid OOM
+                        E = len(ii)
+                        chunk_size = 16 # Small chunk size to stay well within VRAM limits
+                        sce = torch.zeros(E, H_s, W_s, device=self.device, dtype=torch.float32)
+                        
+                        for chunk_start in range(0, E, chunk_size):
+                            chunk_end = min(E, chunk_start + chunk_size)
+                            
+                            # Extract and normalize only the current chunk to save VRAM
+                            jj_chunk = jj[chunk_start:chunk_end].cpu()
+                            ii_chunk = ii[chunk_start:chunk_end].cpu()
+                            
+                            feats_jj_chunk = self.dino_feats_resize[jj_chunk].to(self.device)
+                            feats_ii_chunk = self.dino_feats_resize[ii_chunk].to(self.device)
+                            
+                            feats_jj_chunk = F.normalize(feats_jj_chunk, p=2, dim=1)
+                            feats_ii_chunk = F.normalize(feats_ii_chunk, p=2, dim=1)
+                            
+                            grid_chunk = grid[chunk_start:chunk_end]
+                            
+                            warped_chunk = F.grid_sample(
+                                feats_jj_chunk, grid_chunk, mode='bilinear', padding_mode='zeros', align_corners=True
+                            )
+                            sce[chunk_start:chunk_end] = 1.0 - (feats_ii_chunk * warped_chunk).sum(dim=1)
+                        
+                        # Mask out invalid pixels or out-of-bounds warping
+                        valid_mask = (valid > 0.5) & (grid[..., 0] >= -1.0) & (grid[..., 0] <= 1.0) & \
+                                     (grid[..., 1] >= -1.0) & (grid[..., 1] <= 1.0)
+                        sce[~valid_mask] = 0.0
+                        
+                        # Aggregate: for each source frame ii, keep the max SCE
+                        frame_sce = torch.zeros(
+                            self.counter.value, H_s, W_s, device=self.device
+                        )
+                        for e_idx, src in enumerate(ii.tolist()):
+                            frame_sce[src] = torch.maximum(
+                                frame_sce[src], sce[e_idx]
+                            )
+                        
+                        # We use the SCE directly as the kinematic motion expert gate M
+                        # Soft thresholding/scaling: SCE typically ranges [0, 1].
+                        self.dino_warp_scores[:self.counter.value] = torch.clamp(frame_sce * 2.0, 0.0, 1.0)
+
 
     def get_depth_scale_and_shift(self,index, mono_depth:torch.Tensor, est_depth:torch.Tensor, weights:torch.Tensor):
         '''
@@ -451,25 +519,21 @@ class DepthVideo:
         while i*20 < self.counter.value:
             dino_feat_batch = self.dino_feats[i*20:min((i+1)*20,self.counter.value),:,:,:].to(self.device)
             with Lock():
-                uncer = self.uncer_network(dino_feat_batch)
+                _, uncer, _ = self.uncer_network(dino_feat_batch)
             train_frac = self.cfg['mapping']['uncertainty_params']['train_frac_fix']
 
             h = self.images.shape[2]
             w = self.images.shape[3]
             uncer = torch.clip(uncer, min=0.1) + 1e-3
 
-            # Propagate high uncertainty to semantically similar, spatially nearby
-            # patches within each frame before upsampling to avoid resampling artifacts.
-            uncer = torch.stack([
-                map_utils.propagate_uncertainty_via_dino_similarity(uncer[b], dino_feat_batch[b])
-                for b in range(uncer.shape[0])
-            ])
+
 
             uncer = uncer.unsqueeze(1)
             uncer = F.interpolate(uncer, size=(h, w), mode="bilinear").squeeze(1).detach()
             data_rate = 1 + 1 * map_utils.compute_bias_factor(train_frac, 0.8)
             uncer = uncer[:, self.slice_h, self.slice_w]
             uncer = (uncer - 0.1) * data_rate + 0.1
+
             self.uncertainties_inv[i*20:min((i+1)*20,self.counter.value),:,:] = torch.clamp(0.5/uncer**2, 0.0, 1.0)
 
             i += 1
@@ -482,25 +546,21 @@ class DepthVideo:
 
         dino_feat_batch = self.dino_feats[idxs,:,:,:].to(self.device)
         with Lock():
-            uncer = self.uncer_network(dino_feat_batch)
+            _, uncer, _ = self.uncer_network(dino_feat_batch)
         train_frac = self.cfg['mapping']['uncertainty_params']['train_frac_fix']
 
         h = self.images.shape[2]
         w = self.images.shape[3]
         uncer = torch.clip(uncer, min=0.1) + 1e-3
 
-        # Propagate high uncertainty to semantically similar, spatially nearby
-        # patches within each frame before upsampling to avoid resampling artifacts.
-        uncer = torch.stack([
-            map_utils.propagate_uncertainty_via_dino_similarity(uncer[b], dino_feat_batch[b])
-            for b in range(uncer.shape[0])
-        ])
+
 
         uncer = uncer.unsqueeze(1)
         uncer = torch.nn.functional.interpolate(uncer, size=(h, w), mode="bilinear").squeeze(1).detach()
         data_rate = 1 + 1 * map_utils.compute_bias_factor(train_frac, 0.8)
         uncer = uncer[:, self.slice_h, self.slice_w]
         uncer = (uncer - 0.1) * data_rate + 0.1
+
         self.uncertainties_inv[idxs,:,:] = torch.clamp(0.5/uncer**2, 0.0, 1.0)
 
     def set_dirty(self,index_start, index_end):
