@@ -16,3 +16,4 @@ cam:  #intrinsic is different per scene in TUM, this cam does not have distortio
   distortion: [0.039903, -0.099343, -0.000730, -0.000144, 0.000000]
   H_out: 384
   W_out: 512
+

@@ -91,9 +91,11 @@ class GaussianPacket:
         current_frame=None,
         gtcolor=None,
         gtdepth=None,
-        uncertainty=None,
-        uncertainty_stm=None,
-        uncertainty_ltm=None,
+        rendered_img=None,
+        ssim_map=None,
+        u_fast=None,
+        u_slow=None,
+        dino_warp_score=None,
         keyframes=None,
         finish=False,
         kf_window=None,
@@ -121,9 +123,11 @@ class GaussianPacket:
         self.current_frame = current_frame
         self.gtcolor = self.resize_img(gtcolor, 320)
         self.gtdepth = self.resize_img(gtdepth, 320)
-        self.uncertainty = self.resize_img(uncertainty, 320)
-        self.uncertainty_stm = self.resize_img(uncertainty_stm, 320)
-        self.uncertainty_ltm = self.resize_img(uncertainty_ltm, 320)
+        self.rendered_img = self.resize_img(rendered_img, 320)
+        self.ssim_map = self.resize_img(ssim_map, 320)
+        self.u_fast = self.resize_img(u_fast, 320)
+        self.u_slow = self.resize_img(u_slow, 320)
+        self.dino_warp_score = self.resize_img(dino_warp_score, 320)
         self.keyframes = keyframes
         self.finish = finish
         self.kf_window = kf_window
@@ -137,9 +141,21 @@ class GaussianPacket:
 
         # check if img is numpy
         if isinstance(img, np.ndarray):
-            height = int(width * img.shape[0] / img.shape[1])
-            return cv2.resize(img, (width, height))
-        height = int(width * img.shape[1] / img.shape[2])
+            if img.ndim == 3 and img.shape[0] in [1, 3, 4]:
+                # Channel-first NumPy array (e.g. 3xHxW)
+                # Transpose to channel-last (HxWxC) for cv2.resize
+                img_t = img.transpose(1, 2, 0)
+                height = max(1, int(width * img_t.shape[0] / img_t.shape[1]))
+                resized_t = cv2.resize(img_t, (width, height))
+                # Transpose back to channel-first (CxHxW)
+                if img.shape[0] == 1 and resized_t.ndim == 2:
+                    return resized_t[np.newaxis, ...]
+                return resized_t.transpose(2, 0, 1)
+            else:
+                height = max(1, int(width * img.shape[0] / img.shape[1]))
+                return cv2.resize(img, (width, height))
+        
+        height = max(1, int(width * img.shape[1] / img.shape[2]))
         # img is 3xHxW
         img = torch.nn.functional.interpolate(
             img.unsqueeze(0), size=(height, width), mode="bilinear", align_corners=False

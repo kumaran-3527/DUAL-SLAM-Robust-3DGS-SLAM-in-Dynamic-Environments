@@ -154,7 +154,7 @@ def get_loss_mapping_uncertainty(
     ssim_frac: float,
     initialization: bool = False,
     freeze_uncertainty_loss: bool = False,
-    flow_residual_weight: Tensor = None,  # [H/8, W/8] normalised to [0,1]
+    dino_warp_scores: Tensor = None,  # [H/8, W/8] SCE from DINOv2 feature warping, in [0,1]
 ) -> Tuple[Tensor, Tensor]:
     """Compute mapping loss with uncertainty estimation for SLAM system.
     
@@ -200,13 +200,12 @@ def get_loss_mapping_uncertainty(
     # Compute SSIM loss if enabled
     ssim_loss = 1.0 - ssim(rendered_img, gt_img) if config["Training"]["ssim_loss"] else 0.0
 
-    # Predict uncertainty from DINOv2 features.
-    # Note: flow_residual_weight and image_gradient are passed separately to
+    # Note: dino_warp_scores and image_gradient are passed separately to
     # uncertainty_network for computing the Mixture-of-Experts UKD loss.
     features = viewpoint.features.to(device=rendered_img.device)
-    u_fast, _, u_max = uncertainty_network(
+    u_fast, _ = uncertainty_network(
         features, 
-        dino_warp_scores=flow_residual_weight, 
+        dino_warp_scores=dino_warp_scores, 
         image_grad=viewpoint.grad_mask.to(features.device) if viewpoint.grad_mask is not None else None
     )
 
@@ -217,13 +216,13 @@ def get_loss_mapping_uncertainty(
         ref_depth,
         rendered_depth,
         u_fast,
-        u_max,
+        u_fast,
         opacity.view(*mask_shape),
         train_fraction=train_frac,
         ssim_fraction=ssim_frac,
         uncertainty_config=config["uncertainty_params"],
         mask=rgb_pixel_mask,
-        flow_residual_weight=flow_residual_weight,
+        dino_warp_scores=dino_warp_scores,
     )
 
     # Combine RGB losses

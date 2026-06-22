@@ -151,7 +151,7 @@ mono_prior:
 data:
   output: ./output/wildgs_slam
   colmap:
-    export: True
+    export: False
     keyframe_only: False # True for keyframes only, False for all frames
   input_folder: Please_specify_the_path_to_the_dataset
 

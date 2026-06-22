@@ -1,5 +1,5 @@
 from typing import Union, List, Tuple, Optional
-from math import exp
+from math import exp, sqrt, pi
 
 import torch
 import torch.nn.functional as F
@@ -216,7 +216,7 @@ def compute_mapping_loss_components(
     ssim_fraction: float,
     uncertainty_config: dict,
     mask: Optional[torch.Tensor] = None,
-    flow_residual_weight: Optional[torch.Tensor] = None,
+    dino_warp_scores: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute essential components for uncertainty-aware mapping loss.
@@ -242,11 +242,12 @@ def compute_mapping_loss_components(
         ssim_fraction: SSIM loss weight fraction
         uncertainty_config: Dictionary containing uncertainty estimation parameters
         mask: Optional visibility mask for loss computation [1,H,W]
-        flow_residual_weight: Optional per-patch weight in [0,1] derived from DROID-SLAM
-            flow residuals at the DINOv2 patch resolution [H',W']. When provided, the
-            SSIM-based uncertainty NLL loss is gated by this weight so that patches with
-            near-zero flow residual (static, even if currently unmapped) do not cause the
-            Fast MLP to incorrectly spike their uncertainty (bootstrapping fix).
+        dino_warp_scores: Optional per-patch Semantic Consistency Error (SCE) in [0,1]
+            at DINOv2 patch resolution [H',W']. Derived from cosine distance of DINOv2
+            features warped across BA edges in `depth_video.ba()`. Acts as the kinematic
+            gate M: high SCE (M≈1) means multi-view feature inconsistency — physical motion.
+            Used to modulate the Fast MLP NLL effective residual as a convex interpolation
+            between the photometric SSIM residual (M=0) and a kinematic reference level (M=1).
     """
     # Initialize median pooling for SSIM
     median_filter = MedianPool2d(
@@ -305,18 +306,6 @@ def compute_mapping_loss_components(
         median_filter(small_ssim_loss.unsqueeze(0).unsqueeze(0)).squeeze(0).squeeze(0)
     )
 
-    # --- Bootstrapping fix: gate the uncertainty NLL loss with the flow residual.
-    # If a patch has low flow residual (it is geometrically static, even if GS renders
-    # it poorly because it is newly revealed), we suppress the uncertainty loss so the
-    # Fast MLP does not incorrectly treat it as a dynamic region.
-    if flow_residual_weight is not None:
-        # flow_residual_weight is in [0,1] at DINOv2 patch resolution [H',W']
-        kinematic_gate = resample_tensor_to_shape(
-            flow_residual_weight.detach().to(filtered_ssim_loss.device),
-            filtered_ssim_loss.shape,
-        )
-        filtered_ssim_loss = filtered_ssim_loss * kinematic_gate
-
     # Process depth loss for uncertainty computation
     small_depth_loss = resample_tensor_to_shape(
         torch.clip(depth_l1_loss.squeeze(), max=5.0).detach(),
@@ -329,10 +318,28 @@ def compute_mapping_loss_components(
     # do not penalize far away pixels
     small_depth_loss[small_depth > depth_threshold] = 0.0
 
-    # Compute final uncertainty loss
+    if dino_warp_scores is not None:
+        kinematic_gate = resample_tensor_to_shape(
+            dino_warp_scores.detach().to(filtered_ssim_loss.device),
+            filtered_ssim_loss.shape,
+        )
+        lambda_kin = 0.5
+        kinematic_floor = -lambda_kin * torch.log(1.0 - kinematic_gate + 1e-3)
+        # Normalize to the scale of the current loss batch
+        E_scale = filtered_ssim_loss.detach().mean().clamp(min=1e-3)
+        filtered_ssim_loss = filtered_ssim_loss + kinematic_floor * E_scale
+        
+
+    if dino_warp_scores is not None:
+        # ── Previous: cosine schedule with hardcoded bounds ──────────────────
+        w_min, w_max = 1.0, 1.5
+        log_sigma_weight = w_min + 0.5*(w_max - w_min)*(1.0 + torch.cos(pi*kinematic_gate))
+    else:
+        log_sigma_weight = 1.0
+
     uncertainty_loss = (
         filtered_ssim_loss / processed_uncertainty ** 2
-        + 0.5 * torch.log(processed_uncertainty)
+        + log_sigma_weight * torch.log(processed_uncertainty)
         + uncertainty_config["uncer_depth_mult"]
         * small_depth_loss
         / processed_uncertainty ** 2
@@ -344,6 +351,7 @@ def compute_mapping_loss_components(
     return uncertainty_loss, resized_uncertainty, rgb_l1_loss, depth_l1_loss
 
 """Regularization loss for DINO model based on feature similarity."""
+
 # Constants
 TOP_K_FEATURES = 128
 SIMILARITY_THRESHOLD = 0.75
@@ -353,6 +361,8 @@ SIMILARITY_THRESHOLD = 0.75
 def compute_dino_regularization_loss(
     uncertainty_buffer: Union[torch.Tensor, List[torch.Tensor]],
     feature_buffer: Union[torch.Tensor, List[torch.Tensor]],
+    top_k : Optional[int] = None,
+    similarity_threshold : Optional[float] = None
 ) -> torch.Tensor:
     """
     Compute DINO regularization loss based on uncertainty and feature buffers.
@@ -365,6 +375,12 @@ def compute_dino_regularization_loss(
     Returns:
         torch.Tensor: Mean uncertainty variance across similar features
     """
+
+    if top_k is None:
+        top_k = TOP_K_FEATURES
+    if similarity_threshold is None:
+        similarity_threshold = SIMILARITY_THRESHOLD
+        
     # Convert lists to tensors if needed
     uncertainty = _ensure_tensor(uncertainty_buffer)
     features = _ensure_tensor(feature_buffer)

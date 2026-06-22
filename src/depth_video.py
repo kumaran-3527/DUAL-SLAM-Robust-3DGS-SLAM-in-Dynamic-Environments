@@ -81,6 +81,19 @@ class DepthVideo:
             # DINOv2 warping Semantic Consistency Error (SCE) per keyframe at 1/8 resolution.
             # Aggregated across all BA edges touching each frame during ba().
             self.dino_warp_scores = torch.zeros(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
+            # SCE scheduling: run on new-keyframe events and every SCE_STRIDE BA calls.
+            self._sce_ba_call_count = 0
+            self._sce_new_frame_pending = False
+            self.SCE_STRIDE = 2           # recompute every N BA calls (tune: 2-8)
+            self.SCE_MIN_GAP = 1        # skip stereo pairs and adjacent frames
+            self.SCE_MAX_GAP = 4   # since this counts keyframes not frames larger values can lead to huge viewpoint changes
+            # Init-phase edge-level SCE cache: populated during the frozen warmup graph,
+            # used to modulate BA weights for subsequent init iterations, then freed.
+            self._warmup = cfg['tracking']['warmup']
+            self.cached_sce_f = None          # [E_f, H_s, W_s]
+            self.cached_ii_filtered = None    # [E_f]
+            self.cached_jj_filtered = None    # [E_f]
+            
         else:
             self.dino_feats = None
             self.dino_feats_resize = None
@@ -128,12 +141,12 @@ class DepthVideo:
 
             if len(item[9].shape) == 3:
                 self.dino_feats_resize[index] = F.interpolate(item[9].permute(2,0,1).unsqueeze(0),
-                                                            self.disps_up.shape[-2:], 
-                                                            mode='bilinear').squeeze()[:,self.slice_h,self.slice_w].cpu()
+                                                            self.disps.shape[-2:], 
+                                                            mode='bilinear').squeeze().cpu()
             else:
                 self.dino_feats_resize[index] = F.interpolate(item[9].permute(0,3,1,2),
-                                                            self.disps_up.shape[-2:], 
-                                                            mode='bilinear')[:,:,self.slice_h,self.slice_w].cpu()
+                                                            self.disps.shape[-2:], 
+                                                            mode='bilinear').cpu()
 
     def __setitem__(self, index, item):
         with self.get_lock():
@@ -325,11 +338,21 @@ class DepthVideo:
                                     self.disps_up.shape[-2:], 
                                     mode='bilinear').to(self.device).squeeze()
             valid_x, valid_y = x_coords[valid_mask[0, j_id]], y_coords[valid_mask[0, j_id]]
-            j_dino_valid = j_dino[:, valid_mask[0, j_id]]
-            i_dino_valid = i_dino[:, valid_y, valid_x]
+            src_y, src_x = torch.where(valid_mask[0, j_id])
 
-            # Compute cosine similarity for each valid position
-            similarity = F.normalize(j_dino_valid, p=2, dim=0).mul(F.normalize(i_dino_valid, p=2, dim=0)).sum(dim=0)
+            # Compute cosine similarity for each valid position in chunks to avoid CUDA OOM
+            num_valid = valid_x.shape[0]
+            similarity = torch.zeros(num_valid, device=self.device, dtype=torch.float32)
+            pixel_chunk_size = 50000
+            for chunk_start in range(0, num_valid, pixel_chunk_size):
+                chunk_end = min(num_valid, chunk_start + pixel_chunk_size)
+                
+                j_dino_chunk = j_dino[:, src_y[chunk_start:chunk_end], src_x[chunk_start:chunk_end]]
+                i_dino_chunk = i_dino[:, valid_y[chunk_start:chunk_end], valid_x[chunk_start:chunk_end]]
+                
+                sim_chunk = F.normalize(j_dino_chunk, p=2, dim=0).mul(F.normalize(i_dino_chunk, p=2, dim=0)).sum(dim=0)
+                similarity[chunk_start:chunk_end] = sim_chunk
+
             matching_mask = similarity > 0.9
 
             # Update projected disparity and counts based on the similarity check
@@ -350,11 +373,48 @@ class DepthVideo:
         torch.cuda.empty_cache()
 
         self.mono_disps_mask_up[idx][(accurate_count<=1)&(inaccurate_count>0)&(self.mono_disps_up[idx]>0)] = False
+        
 
     def ba(self, target, weight, eta, ii, jj, t0=1, t1=None, iters=2, lm=1e-4, ep=0.1,
            motion_only=False):
+
         if self.uncertainty_aware:
-            weight *= self.uncertainties_inv[ii][None, :, :, :, None]
+            # 1. Source pixel inverse uncertainty
+            u_inv_i = self.uncertainties_inv[ii][None, :, :, :, None]
+            weight *= u_inv_i
+
+            # 2. Init-phase edge-level SCE gate.
+            # During warmup the graph is frozen, so sce_f from the previous BA call
+            # is valid for the current one. Apply (1 - sce) as a per-edge weight to
+            # suppress dynamic pixels before poses/depths have converged.
+            # Once init is done, the cache is freed and this branch is skipped.
+            if self.cached_sce_f is not None and self.counter.value <= self._warmup:
+                H_s = self.ht // self.down_scale
+                W_s = self.wd // self.down_scale
+                E_ba = len(ii)
+
+                # Vectorised edge matching: find which active edges have a cached SCE
+                # match shape: [E_ba, E_f]
+                match = (
+                    (ii[:, None] == self.cached_ii_filtered[None, :]) &
+                    (jj[:, None] == self.cached_jj_filtered[None, :])
+                )
+                has_match = match.any(dim=1)          # [E_ba]
+                edge_sce = torch.zeros(E_ba, H_s, W_s, device=self.device)
+                if has_match.any():
+                    match_idx = match.float().argmax(dim=1)  # [E_ba]
+                    edge_sce[has_match] = self.cached_sce_f[match_idx[has_match]]
+
+                # High SCE → low weight (dynamic pixel rejected).
+                # Shape: [1, E_ba, H_s, W_s, 1] broadcast against weight [1, E, H, W, 2]
+                sce_gate = (1.0 - edge_sce)[None, ..., None]
+                weight *= sce_gate
+
+            # Clear cache as soon as the init phase is over to free GPU memory.
+            elif self.cached_sce_f is not None and self.counter.value > self._warmup:
+                self.cached_sce_f = None
+                self.cached_ii_filtered = None
+                self.cached_jj_filtered = None
 
         with self.get_lock():
             # [t0, t1] window of bundle adjustment optimization
@@ -379,66 +439,213 @@ class DepthVideo:
             # After BA updates poses/disps, we warp the semantic DINOv2 features
             # to check for rigid-semantic inconsistency. Moving objects violate 
             # the static world assumption, causing high SCE at object boundaries.
-            if self.uncertainty_aware and not motion_only:
-                with torch.no_grad():
-                    # induced_coords: [1, E, H/8, W/8, 2] — where pixels in ii
-                    # land in jj under the current rigid pose + depth estimate.
-                    induced_coords, valid = pops.projective_transform(
-                        lietorch.SE3(self.poses[None]), self.disps[None],
-                        self.intrinsics[None], ii, jj
-                    )  # [1, E, H/8, W/8, 2]
-                    valid = valid[0, ..., 0] # [E, H/8, W/8]
+            #
+            # Scheduling: since motion_only is never actually True in the call chain
+            # (frontend and backend always pass motion_only=False), we gate on:
+            #   (a) a new keyframe was just confirmed (_sce_new_frame_pending=True), OR
+            #   (b) every SCE_STRIDE ba calls elapsed.
+            if self.uncertainty_aware:
+                self._sce_ba_call_count += 1
+                _run_sce = self._sce_new_frame_pending or (self._sce_ba_call_count >= self.SCE_STRIDE)
+                if _run_sce:
+                    self._sce_ba_call_count = 0
+                    self._sce_new_frame_pending = False
+                    with torch.no_grad():
+                        # ── Active Edge Enumeration ──────────────────────────────────────────
+                        # We consider only active edges within the defined window [t0, t1)
+                        # and filter them by the min/max gap constraints.
+                        t0_sce = max(0, t0)
+                        window_mask = (ii >= t0_sce) & (jj >= t0_sce) & (ii < t1) & (jj < t1)
+                        ii_active = ii[window_mask]
+                        jj_active = jj[window_mask]
+                        
+                        if len(ii_active) > 0:
+                            gap = (ii_active - jj_active).abs()
+                            temporal_gap_mask = (gap >= self.SCE_MIN_GAP)
 
-                    # Format induced_coords for grid_sample [-1, 1]
-                    if self.dino_feats_resize is not None:
-                        W_s = self.wd // self.down_scale
-                        H_s = self.ht // self.down_scale
-                        grid = induced_coords.squeeze(0).clone() # [E, H_s, W_s, 2]
-                        grid[..., 0] = 2.0 * grid[..., 0] / (W_s - 1) - 1.0
-                        grid[..., 1] = 2.0 * grid[..., 1] / (H_s - 1) - 1.0
-                        
-                        # Compute Semantic Consistency Error (SCE) in chunks to avoid OOM
-                        E = len(ii)
-                        chunk_size = 16 # Small chunk size to stay well within VRAM limits
-                        sce = torch.zeros(E, H_s, W_s, device=self.device, dtype=torch.float32)
-                        
-                        for chunk_start in range(0, E, chunk_size):
-                            chunk_end = min(E, chunk_start + chunk_size)
-                            
-                            # Extract and normalize only the current chunk to save VRAM
-                            jj_chunk = jj[chunk_start:chunk_end].cpu()
-                            ii_chunk = ii[chunk_start:chunk_end].cpu()
-                            
-                            feats_jj_chunk = self.dino_feats_resize[jj_chunk].to(self.device)
-                            feats_ii_chunk = self.dino_feats_resize[ii_chunk].to(self.device)
-                            
-                            feats_jj_chunk = F.normalize(feats_jj_chunk, p=2, dim=1)
-                            feats_ii_chunk = F.normalize(feats_ii_chunk, p=2, dim=1)
-                            
-                            grid_chunk = grid[chunk_start:chunk_end]
-                            
-                            warped_chunk = F.grid_sample(
-                                feats_jj_chunk, grid_chunk, mode='bilinear', padding_mode='zeros', align_corners=True
+                            ii_filtered = ii_active[temporal_gap_mask]
+                            jj_filtered = jj_active[temporal_gap_mask]
+                        else:
+                            ii_filtered = torch.empty(0, dtype=torch.long, device=self.device)
+                            jj_filtered = torch.empty(0, dtype=torch.long, device=self.device)
+
+
+                        if len(ii_filtered) == 0 or self.dino_feats_resize is None:
+                            pass
+                        else:
+                            W_s = self.wd // self.down_scale
+                            H_s = self.ht // self.down_scale
+
+                            # ── Condition 2: Geometric Validity ──
+                            # Re-project source pixels into 3D and warp into target frame.
+                            # We need the 3D point in the target frame (X1) to check
+                            # the MIN_DEPTH condition.  We replicate the projective ops
+                            # inline so we can access the intermediate Z value.
+                            MIN_DEPTH_SCE = 0.25
+
+                            # Lift source pixels to 3D: X0 = [X, Y, 1, disp] in source cam
+                            X0, _ = pops.iproj(
+                                self.disps[None, ii_filtered],
+                                self.intrinsics[None, ii_filtered],
+                            )  # [1, E_f, H_s, W_s, 4]
+
+                            # Relative pose: T_jj * T_ii^{-1}
+                            poses_se3 = lietorch.SE3(self.poses[None])
+                            Gij = poses_se3[:, jj_filtered] * poses_se3[:, ii_filtered].inv()
+                            # Perturb self-edges to prevent zero-division
+                            Gij.data[:, ii_filtered == jj_filtered] = torch.as_tensor(
+                                [-0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], device=self.device
                             )
-                            sce[chunk_start:chunk_end] = 1.0 - (feats_ii_chunk * warped_chunk).sum(dim=1)
-                        
-                        # Mask out invalid pixels or out-of-bounds warping
-                        valid_mask = (valid > 0.5) & (grid[..., 0] >= -1.0) & (grid[..., 0] <= 1.0) & \
-                                     (grid[..., 1] >= -1.0) & (grid[..., 1] <= 1.0)
-                        sce[~valid_mask] = 0.0
-                        
-                        # Aggregate: for each source frame ii, keep the max SCE
-                        frame_sce = torch.zeros(
-                            self.counter.value, H_s, W_s, device=self.device
-                        )
-                        for e_idx, src in enumerate(ii.tolist()):
-                            frame_sce[src] = torch.maximum(
-                                frame_sce[src], sce[e_idx]
+
+                            # Apply rigid transform: X1 = Gij * X0  [1, E_f, H_s, W_s, 4]
+                            X1, _ = pops.actp(Gij, X0)
+
+                            # Project X1 into target image: x1  [1, E_f, H_s, W_s, 2]
+                            x1, _ = pops.proj(X1, self.intrinsics[None, jj_filtered])
+
+                            X1 = X1.squeeze(0)  # [E_f, H_s, W_s, 4]
+                            x1 = x1.squeeze(0)  # [E_f, H_s, W_s, 2]
+
+                            # Z-depth in the target camera frame
+                            Z_target = X1[..., 2]  # [E_f, H_s, W_s]
+
+                            # Pixel-level geometric validity: depth floor + image boundary
+                            u = x1[..., 0]  # x-coord in target image
+                            v = x1[..., 1]  # y-coord in target image
+                            geom_valid = (
+                                (Z_target >= MIN_DEPTH_SCE) &
+                                (u >= 0.0) & (u <= W_s - 1.0) &
+                                (v >= 0.0) & (v <= H_s - 1.0)
+                            )  # [E_f, H_s, W_s]
+
+                            # Build normalized grid for grid_sample from the projected coords
+                            # (reuse x1 which is already in pixel-space)
+                            grid = x1.clone()  # [E_f, H_s, W_s, 2]
+                            grid[..., 0] = 2.0 * grid[..., 0] / (W_s - 1) - 1.0
+                            grid[..., 1] = 2.0 * grid[..., 1] / (H_s - 1) - 1.0
+
+                            # ── Condition 3: Cosine Similarity with Clamping & Threshold ──
+                            E_f = len(ii_filtered)
+                            chunk_size = 16
+                            sce_f = torch.zeros(E_f, H_s, W_s, device=self.device, dtype=torch.float32)
+
+                            for chunk_start in range(0, E_f, chunk_size):
+                                chunk_end = min(E_f, chunk_start + chunk_size)
+
+                                jj_chunk = jj_filtered[chunk_start:chunk_end].cpu()
+                                ii_chunk = ii_filtered[chunk_start:chunk_end].cpu()
+
+                                feats_jj_chunk = self.dino_feats_resize[jj_chunk].to(self.device)
+                                feats_ii_chunk = self.dino_feats_resize[ii_chunk].to(self.device)
+
+                                # L2-normalize along the channel dim for true cosine similarity
+                                feats_jj_chunk = F.normalize(feats_jj_chunk, p=2, dim=1)
+                                feats_ii_chunk = F.normalize(feats_ii_chunk, p=2, dim=1)
+
+                                grid_chunk = grid[chunk_start:chunk_end]
+
+                                # Bilinear interpolation of target features at projected coords
+                                warped_chunk = F.grid_sample(
+                                    feats_jj_chunk, grid_chunk,
+                                    mode='bilinear', padding_mode='zeros', align_corners=True
+                                )
+
+                                # Cosine similarity = dot product (already L2-normalized)
+                                cos_sim = (feats_ii_chunk * warped_chunk).sum(dim=1)  # [chunk, H_s, W_s]
+
+                                # Clamp to [0, 1] to reject outlier negative similarities
+                                cos_sim = torch.clamp(cos_sim, min=0.0, max=1.0)
+
+                               # # Hard threshold: zero out low-confidence matches (<= 0.5)
+                                cos_sim = torch.where(
+                                    cos_sim >= 0.10, cos_sim, torch.zeros_like(cos_sim)
+                                )
+                                # cos_sim = torch.where(
+                                #     cos_sim <= 0.85, cos_sim, torch.ones_like(cos_sim)
+                                # )
+
+                                # SCE = 1 - cosine_similarity (high SCE = semantically inconsistent)
+                                sce_f[chunk_start:chunk_end] = 1.0 - cos_sim
+
+                            # Zero out pixels that failed geometric validity
+                            sce_f[~geom_valid] = 0.0
+
+                            # ── Aggregation: 1/Delta Weighted Mean ──────────────────────
+                            # We take the weighted mean of the SCE scores using 1/delta
+                            # as the weight. This trusts short-baseline edges more.
+                            #
+                            # Previous approach (Logit Bayesian Fusion) COMMENTED OUT:
+                            #   sce_p = torch.clamp(sce_f, 1e-4, 1.0 - 1e-4)
+                            #   sce_logits = torch.log(sce_p / (1.0 - sce_p))
+                            #   ...
+                            #   mean_logit = weighted_logits.sum(dim=0) / weight_sum.clamp(min=1e-6)
+                            #   frame_sce[src] = torch.sigmoid(mean_logit)
+
+                            from collections import defaultdict
+                            frame_edge_sce  = defaultdict(list)
+                            frame_edge_mask = defaultdict(list)
+                            frame_edge_weight = defaultdict(list)
+
+                            fwd_edge_count = torch.zeros(self.counter.value, device=self.device)
+                            bwd_edge_count = torch.zeros(self.counter.value, device=self.device)
+
+                            for e_idx, src in enumerate(ii_filtered.tolist()):
+                                dst = jj_filtered[e_idx].item()
+                                delta = max(1, abs(src - dst))  # prevent division by zero
+                                weight = 1.0
+                                
+                                frame_edge_sce[src].append(sce_f[e_idx])
+                                frame_edge_mask[src].append(geom_valid[e_idx].float())
+                                frame_edge_weight[src].append(torch.full((H_s, W_s), weight, device=self.device))
+                                
+                                if src < dst:
+                                    fwd_edge_count[src] += 1
+                                elif src > dst:
+                                    bwd_edge_count[src] += 1
+
+                            frame_sce = torch.zeros(
+                                self.counter.value, H_s, W_s, device=self.device
                             )
-                        
-                        # We use the SCE directly as the kinematic motion expert gate M
-                        # Soft thresholding/scaling: SCE typically ranges [0, 1].
-                        self.dino_warp_scores[:self.counter.value] = torch.clamp(frame_sce * 2.0, 0.0, 1.0)
+
+                            for src, edges in frame_edge_sce.items():
+                                stacked = torch.stack(edges, dim=0)       # [E, H_s, W_s]
+                                masks   = torch.stack(frame_edge_mask[src], dim=0)  # [E, H_s, W_s]
+                                weights = torch.stack(frame_edge_weight[src], dim=0) # [E, H_s, W_s]
+
+                                # Apply 1/delta weights during aggregation
+                                weighted_sce = stacked * weights * masks
+                                weight_sum = (weights * masks).sum(dim=0)
+                                frame_sce[src] = weighted_sce.sum(dim=0) / weight_sum.clamp(min=1e-6)
+
+                            # Fallback: Bidirectional Edge Requirement
+                            # To avoid occlusion/motion ambiguity, a frame must have at least 
+                            # k_frames edge looking forward AND backward in time.
+                            k_frames = 1
+                            clamped_sce = torch.clamp(frame_sce, 0.0, 1.0)
+                            
+                            missing_bwd = bwd_edge_count < k_frames
+                            missing_fwd = fwd_edge_count < k_frames
+                            
+                            # Exempt the absolute newest frames in the system from the forward-edge 
+                            # requirement, as future frames do not exist yet for them to warp to.
+                            is_newest_boundary = torch.arange(self.counter.value, device=self.device) >= (self.counter.value - k_frames)
+                            
+                            invalid_frames = missing_bwd | (missing_fwd & ~is_newest_boundary)
+                            clamped_sce[invalid_frames] = -1.0
+
+                            # ONLY update frames that were actively evaluated in this BA window
+                            # This preserves historical scores for frames that weren't touched
+                            active_srcs = torch.unique(ii_filtered)
+                            if len(active_srcs) > 0:
+                                self.dino_warp_scores[active_srcs] = clamped_sce[active_srcs]
+
+                            # Cache raw edge-level SCE for init-phase BA weighting.
+                            # Only store during warmup; the cache is cleared automatically
+                            # in ba() once counter exceeds _warmup.
+                            if self.counter.value <= self._warmup:
+                                self.cached_sce_f = sce_f.detach().clone()
+                                self.cached_ii_filtered = ii_filtered.clone()
+                                self.cached_jj_filtered = jj_filtered.clone()
 
 
     def get_depth_scale_and_shift(self,index, mono_depth:torch.Tensor, est_depth:torch.Tensor, weights:torch.Tensor):
@@ -519,7 +726,7 @@ class DepthVideo:
         while i*20 < self.counter.value:
             dino_feat_batch = self.dino_feats[i*20:min((i+1)*20,self.counter.value),:,:,:].to(self.device)
             with Lock():
-                _, uncer, _ = self.uncer_network(dino_feat_batch)
+                _, uncer = self.uncer_network(dino_feat_batch)
             train_frac = self.cfg['mapping']['uncertainty_params']['train_frac_fix']
 
             h = self.images.shape[2]
@@ -546,7 +753,7 @@ class DepthVideo:
 
         dino_feat_batch = self.dino_feats[idxs,:,:,:].to(self.device)
         with Lock():
-            _, uncer, _ = self.uncer_network(dino_feat_batch)
+            _, uncer = self.uncer_network(dino_feat_batch)
         train_frac = self.cfg['mapping']['uncertainty_params']['train_frac_fix']
 
         h = self.images.shape[2]

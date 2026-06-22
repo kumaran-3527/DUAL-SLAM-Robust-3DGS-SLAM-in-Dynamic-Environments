@@ -64,6 +64,8 @@ def get_dataset(cfg, device='cuda:0'):
     return dataset_dict[cfg['dataset']](cfg, device=device)
 
 
+
+
 class BaseDataset(Dataset):
     def __init__(self, cfg, device='cuda:0'):
         super(BaseDataset, self).__init__()
@@ -412,6 +414,8 @@ class TUM_RGBD(BaseDataset):
         pose[:3, 3] = pvec[:3]
         return pose
 
+
+
 class SevenScenes(BaseDataset):
     def __init__(self, cfg, device='cuda:0'
                  ):
@@ -455,6 +459,7 @@ class SevenScenes(BaseDataset):
         pose[:3, :3] = Rotation.from_quat(pvec[3:]).as_matrix()
         pose[:3, 3] = pvec[:3]
         return pose
+
 class RGB_NoPose(BaseDataset):
     def __init__(self, cfg, device='cuda:0'
                  ):
@@ -472,6 +477,203 @@ class RGB_NoPose(BaseDataset):
         self.color_paths = self.color_paths[:max_frames][::stride]
         self.n_img = len(self.color_paths)
 
+class YouTube(BaseDataset):
+    def __init__(self, cfg, device='cuda:0'
+                 ):
+        super(YouTube, self).__init__(cfg, device)
+        self.color_paths = sorted(
+            glob.glob(f'{self.input_folder}/frame_*.jpg'))
+        self.depth_paths = None
+        self.poses = None
+
+        stride = cfg['stride']
+        max_frames = cfg['max_frames']
+        if max_frames < 0:
+            max_frames = len(self.color_paths)
+
+        self.color_paths = self.color_paths[:max_frames][::stride]
+        self.n_img = len(self.color_paths)
+
+
+class DROIDW(BaseDataset):
+    def __init__(self, cfg, device='cuda:0'):
+        super(DROIDW, self).__init__(cfg, device)
+        
+        # Load all image paths
+        color_paths_all = sorted(
+            glob.glob(os.path.join(self.input_folder, 'images_anonymized', '*.jpg')) +
+            glob.glob(os.path.join(self.input_folder, 'images_anonymized', '*.png'))
+        )
+        if len(color_paths_all) == 0:
+            raise FileNotFoundError(f"No images found in {os.path.join(self.input_folder, 'images_anonymized')}")
+            
+        tstamp_image = np.array([float(os.path.splitext(os.path.basename(p))[0]) for p in color_paths_all])
+
+        # Load poses from traj_gt_fastlivo.txt (or traj_gt_fastlio.txt)
+        pose_file = os.path.join(self.input_folder, 'traj_gt_fastlivo.txt')
+        if not os.path.exists(pose_file):
+            pose_file = os.path.join(self.input_folder, 'traj_gt.txt')
+            
+        if not os.path.exists(pose_file):
+            raise FileNotFoundError(f"No pose file found at {self.input_folder} (tried traj_gt_fastlivo.txt and traj_gt_fastlio.txt)")
+            
+        pose_data = np.loadtxt(pose_file, dtype=np.float64)
+        if pose_data.ndim == 1:
+            pose_data = pose_data[None, :]
+        tstamp_pose = pose_data[:, 0]
+        pose_vecs = pose_data[:, 1:]
+
+        # Associate images and poses
+        max_dt = 0.05
+        associations = []
+        for k, tp in enumerate(tstamp_pose):
+            i = np.argmin(np.abs(tstamp_image - tp))
+            dt = np.abs(tstamp_image[i] - tp)
+            if dt < max_dt:
+                associations.append((i, k))
+        
+        associations = sorted(associations, key=lambda x: x[0])
+        
+        self.color_paths = []
+        self.poses = []
+        inv_pose = None
+        for i, k in associations:
+            self.color_paths.append(color_paths_all[i])
+            c2w = self.pose_matrix_from_quaternion(pose_vecs[k])
+            if inv_pose is None:
+                inv_pose = np.linalg.inv(c2w)
+                c2w = np.eye(4)
+            else:
+                c2w = inv_pose @ c2w
+            self.poses.append(c2w)
+            
+        self.w2c_first_pose = inv_pose
+        self.depth_paths = None
+
+        stride = cfg['stride']
+        max_frames = cfg['max_frames']
+        if max_frames < 0:
+            max_frames = len(self.color_paths)
+
+        self.color_paths = self.color_paths[:max_frames][::stride]
+        self.poses = self.poses[:max_frames][::stride]
+        self.n_img = len(self.color_paths)
+        print("INFO: {} images got for DROIDW dataset!".format(self.n_img))
+
+    def pose_matrix_from_quaternion(self, pvec):
+        """ convert 4x4 pose matrix to (t, q) """
+        from scipy.spatial.transform import Rotation
+
+        pose = np.eye(4)
+        pose[:3, :3] = Rotation.from_quat(pvec[3:]).as_matrix()
+        pose[:3, 3] = pvec[:3]
+        return pose
+
+class Dycheck(BaseDataset):
+    """This is from splat-slam, never test it (todo)"""
+    def __init__(self, cfg, device='cuda:0'):
+        super(Dycheck, self).__init__(cfg, device)
+        stride = cfg['stride']
+        max_frames = cfg['max_frames']
+        color_paths = sorted(glob.glob(os.path.join(
+            self.input_folder, 'dense/images', '*.png')), key=lambda x: int(os.path.basename(x)[:-4]))
+        depth_paths = sorted(glob.glob(os.path.join(
+            self.input_folder, 'depth/1x', '*.npy')), key=lambda x: int(os.path.basename(x)[:-4]))
+        if max_frames < 0:
+            max_frames = len(color_paths)
+        self.color_paths = color_paths[:max_frames][::stride]
+        self.depth_paths = depth_paths[:max_frames][::stride]
+
+        self.load_poses(os.path.join(self.input_folder, 'dense'))
+        self.poses = self.poses[:max_frames][::stride]
+
+        assert len(self.color_paths) == self.poses.shape[0]
+        assert len(self.color_paths) == len(self.depth_paths)
+
+        self.n_img = len(self.color_paths)
+        print("INFO: {} images got!".format(self.n_img))
+
+        if cfg['save_gt_poses']:
+            output_folder = cfg["data"]["output"] + "/" + cfg["scene"]
+            self.save_gt_poses(os.path.join(output_folder, 'gt_poses.txt'), self.poses)
+
+    def save_gt_poses(self, path, poses):
+        # convert rotation matrix to quaternions, save to txt file
+        idx = 0
+        with open(path, 'w') as f:
+            for pose in poses:
+                quaternion = Rotation.from_matrix(pose[:3, :3]).as_quat()
+                translation = pose[:3, 3]
+                associated_img_path = self.color_paths[idx]
+                # remove the extension only .png
+                timestamp = float(os.path.basename(associated_img_path)[:-4])
+                f.write(f"{timestamp} {translation[0]:.6f} {translation[1]:.6f} {translation[2]:.6f} {quaternion[0]:.6f} {quaternion[1]:.6f} {quaternion[2]:.6f} {quaternion[3]:.6f}\n")
+                idx += 1
+        print("INFO: GT poses saved to {}".format(path))
+
+    def load_poses(self, path):
+        gt_cam2w = self.load_colmap_data(path)
+
+        # normalize the poses
+        full_t = np.dot(np.linalg.inv(gt_cam2w[-1]), gt_cam2w[0])
+        normalize_scale = np.linalg.norm(full_t[:3, 3]) + 1e-8
+        gt_cam2w[:, :3, 3] /= normalize_scale
+        self.poses = gt_cam2w
+
+    def load_colmap_data(self, realdir):
+        """Load colmap data."""
+        camerasfile = os.path.join(realdir, "sparse/cameras.bin")
+        camdata = read_model.read_cameras_binary(camerasfile)
+
+        list_of_keys = list(camdata.keys())
+        cam = camdata[list_of_keys[0]]
+        print("Cameras", len(cam))
+
+        imagesfile = os.path.join(realdir, "sparse/images.bin")
+        imdata = read_model.read_images_binary(imagesfile)
+
+        w2c_mats = []
+        bottom = np.array([0, 0, 0, 1.0]).reshape([1, 4])
+
+        names = [imdata[k].name for k in imdata]
+        img_keys = [k for k in imdata]
+
+        print("Images #", len(names))
+        perm = np.argsort(names)
+
+        points3dfile = os.path.join(realdir, "sparse/points3D.bin")
+        pts3d = read_model.read_points3d_binary(points3dfile)
+
+        # extract point 3D xyz
+        point_cloud = []
+        for key in pts3d:
+            point_cloud.append(pts3d[key].xyz)
+
+        upper_bound = 100000
+
+        if upper_bound < len(img_keys):
+            print("Only keeping " + str(upper_bound) + " images!")
+
+        for i in perm[0 : min(upper_bound, len(img_keys))]:
+            im = imdata[img_keys[i]]
+            if "2_" in im.name:
+                continue
+
+            if "1_" in im.name:
+                continue
+
+            # print(im.name)
+            R = im.qvec2rotmat()
+            t = im.tvec.reshape([3, 1])
+            m = np.concatenate([np.concatenate([R, t], 1), bottom], 0)
+            w2c_mats.append(m)
+
+        w2c_mats = np.stack(w2c_mats, 0)
+        # bounds_mats = np.stack(bounds_mats, 0)
+        c2w_mats = np.linalg.inv(w2c_mats)
+
+        return c2w_mats
+
 dataset_dict = {
     "replica": Replica,
     "scannet": ScanNet,
@@ -479,5 +681,7 @@ dataset_dict = {
     "bonn_dynamic": TUM_RGBD,
     "wild_slam_mocap": TUM_RGBD,
     "7scenes": SevenScenes,
-    "wild_slam_iphone": RGB_NoPose
+    "wild_slam_iphone": RGB_NoPose,
+    "droidw": DROIDW,
+    'youtube' : YouTube
 }
