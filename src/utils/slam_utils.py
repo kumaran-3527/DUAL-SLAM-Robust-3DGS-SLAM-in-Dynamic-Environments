@@ -155,6 +155,7 @@ def get_loss_mapping_uncertainty(
     initialization: bool = False,
     freeze_uncertainty_loss: bool = False,
     dino_warp_scores: Tensor = None,  # [H/8, W/8] SCE from DINOv2 feature warping, in [0,1]
+    geom_label: Tensor = None,  # [H/8, W/8] geometric pseudo-label from tracker (experience replay)
 ) -> Tuple[Tensor, Tensor]:
     """Compute mapping loss with uncertainty estimation for SLAM system.
     
@@ -209,6 +210,14 @@ def get_loss_mapping_uncertainty(
         image_grad=viewpoint.grad_mask.to(features.device) if viewpoint.grad_mask is not None else None
     )
 
+    # Compute scaled tracking weight (W) to use as the Adaptive Bayesian Prior penalty
+    tracker_weight = None
+    if geom_label is not None:
+        m_scale = 45.0
+        c_scale = 35.5
+        u_final_scaled = torch.clamp(m_scale * geom_label - c_scale, min=0.1)
+        tracker_weight = torch.clamp(0.5 / (u_final_scaled**2 + 1e-6), min=0.01, max=1.0)
+
      # Compute mapping losses with uncertainty
     uncer_loss, uncer_resized, l1_rgb, l1_depth = map_utils.compute_mapping_loss_components(
         gt_img,
@@ -223,6 +232,7 @@ def get_loss_mapping_uncertainty(
         uncertainty_config=config["uncertainty_params"],
         mask=rgb_pixel_mask,
         dino_warp_scores=dino_warp_scores,
+        tracker_weight=tracker_weight,
     )
 
     # Combine RGB losses
@@ -263,6 +273,29 @@ def get_loss_mapping_uncertainty(
         config["uncertainty_params"]["ssim_mult"] * uncer_loss.mean()
     )
 
+    # Experience Replay Distillation: align mapper with geometric pseudo-labels from tracker
+    if geom_label is not None:
+        geom_label_resized = F.interpolate(
+            geom_label.unsqueeze(0).unsqueeze(0),
+            size=u_fast.shape,
+            mode='bilinear',
+            align_corners=False,
+        ).squeeze(0).squeeze(0)
+        distill_mult = config["uncertainty_params"].get("distill_mult", 0.01)
+        
+        # Z-Score Distillation: Normalize both to mean=0, std=1 before L1.
+        # This forces the Mapper to learn the Tracker's geometric *contrast* pattern
+        # (which pixels are dynamic vs static) without fighting over absolute scale.
+        # Z-Score L1 magnitude is ~0.8 (expected |N(0,1) - N(0,1)|), so at
+        # distill_mult=0.01 this contributes ~0.008 — about 2-5% of total_loss.
+        u_fast_norm = (u_fast - u_fast.mean()) / (u_fast.std() + 1e-6)
+        geom_label_norm = (geom_label_resized - geom_label_resized.mean()) / (geom_label_resized.std() + 1e-6)
+        
+        distill_loss = F.l1_loss(u_fast_norm, geom_label_norm.detach())
+        # print("distill_loss", distill_loss.item(), "total_loss", total_loss.item())
+
+        total_loss = total_loss + distill_mult * distill_loss
+        
     return u_fast, total_loss
 
 def get_median_depth(depth, opacity=None, mask=None, return_std=False):

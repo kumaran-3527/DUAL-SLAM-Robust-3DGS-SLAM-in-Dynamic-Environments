@@ -154,13 +154,21 @@ class GaussianPacket:
             else:
                 height = max(1, int(width * img.shape[0] / img.shape[1]))
                 return cv2.resize(img, (width, height))
-        
+        if not isinstance(img, torch.Tensor):
+            img = torch.tensor(img)
+        was_2d = img.dim() == 2
+        if was_2d:
+            img = img.unsqueeze(0)
+            
         height = max(1, int(width * img.shape[1] / img.shape[2]))
-        # img is 3xHxW
+        # img is CxHxW
         img = torch.nn.functional.interpolate(
             img.unsqueeze(0), size=(height, width), mode="bilinear", align_corners=False
-        )
-        return img.squeeze(0)
+        ).squeeze(0)
+        
+        if was_2d:
+            img = img.squeeze(0)
+        return img
 
     def get_covariance(self, scaling_modifier=1):
         return self.build_covariance_from_scaling_rotation(

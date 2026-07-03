@@ -239,6 +239,7 @@ class SLAM_GUI:
 
         self.in_original_img_widget = gui.ImageWidget()
         self.in_rendered_img_widget = gui.ImageWidget()
+        self.in_depth_widget = gui.ImageWidget()
         self.in_ssim_widget = gui.ImageWidget()
         self.in_u_fast_widget = gui.ImageWidget()
         self.in_u_slow_widget = gui.ImageWidget()
@@ -248,11 +249,13 @@ class SLAM_GUI:
         tab_info.add_child(self.in_original_img_widget)
         tab_info.add_child(gui.Label("Rendered Image"))
         tab_info.add_child(self.in_rendered_img_widget)
+        tab_info.add_child(gui.Label("Depth Map"))
+        tab_info.add_child(self.in_depth_widget)
         tab_info.add_child(gui.Label("L1 Error Map"))
         tab_info.add_child(self.in_ssim_widget)
-        tab_info.add_child(gui.Label("u_fast (Reactive)"))
+        tab_info.add_child(gui.Label("Mapping Uncertainty"))
         tab_info.add_child(self.in_u_fast_widget)
-        tab_info.add_child(gui.Label("u_slow (Persistent)"))
+        tab_info.add_child(gui.Label("Tracking Uncertainty"))
         tab_info.add_child(self.in_u_slow_widget)
         tab_info.add_child(gui.Label("DINO Warping Score (SCE)"))
         tab_info.add_child(self.in_dino_warp_widget)
@@ -545,8 +548,13 @@ class SLAM_GUI:
 
         _render_map_to_widget(gaussian_packet.ssim_map, self.in_ssim_widget, max_val=0.5)
         _render_map_to_widget(gaussian_packet.u_fast, self.in_u_fast_widget)
-        _render_map_to_widget(gaussian_packet.u_slow, self.in_u_slow_widget)
+        # We now visualize (1.0 - BA_weight), which strictly ranges from 0.0 to ~0.99.
+        # Max_val=1.0 ensures dynamic objects hit the top of the Red scale perfectly.
+        _render_map_to_widget(gaussian_packet.u_slow, self.in_u_slow_widget, max_val=1.0)
         _render_map_to_widget(gaussian_packet.dino_warp_score, self.in_dino_warp_widget, max_val=1.0)
+        
+        if getattr(gaussian_packet, "gtdepth", None) is not None:
+            _render_map_to_widget(gaussian_packet.gtdepth, self.in_depth_widget, max_val=10.0)
 
         if gaussian_packet.finish:
             Log("Received terminate signal", tag="GUI")

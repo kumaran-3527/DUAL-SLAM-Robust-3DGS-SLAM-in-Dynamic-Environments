@@ -127,6 +127,8 @@ class Frontend:
 
         with self.video.get_lock():
             self.video.set_dirty(0, self.t1)
+            if hasattr(self.video, 'is_initialized'):
+                self.video.is_initialized = True
 
         self.graph.rm_factors(self.graph.ii < self.warmup-4, store=True)
 
@@ -158,6 +160,8 @@ class Frontend:
 
         with self.video.get_lock():
             self.video.set_dirty(0, self.t1)
+            if hasattr(self.video, 'is_initialized_fully'):
+                self.video.is_initialized_fully = True
 
         self.graph.rm_factors(self.graph.ii < self.warmup-4, store=True)
 

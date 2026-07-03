@@ -217,6 +217,7 @@ def compute_mapping_loss_components(
     uncertainty_config: dict,
     mask: Optional[torch.Tensor] = None,
     dino_warp_scores: Optional[torch.Tensor] = None,
+    tracker_weight: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute essential components for uncertainty-aware mapping loss.
@@ -318,22 +319,27 @@ def compute_mapping_loss_components(
     # do not penalize far away pixels
     small_depth_loss[small_depth > depth_threshold] = 0.0
 
-    if dino_warp_scores is not None:
-        kinematic_gate = resample_tensor_to_shape(
-            dino_warp_scores.detach().to(filtered_ssim_loss.device),
-            filtered_ssim_loss.shape,
-        )
-        lambda_kin = 0.5
-        kinematic_floor = -lambda_kin * torch.log(1.0 - kinematic_gate + 1e-3)
-        # Normalize to the scale of the current loss batch
-        E_scale = filtered_ssim_loss.detach().mean().clamp(min=1e-3)
-        filtered_ssim_loss = filtered_ssim_loss + kinematic_floor * E_scale
-        
+    # if dino_warp_scores is not None:
+    #     kinematic_gate = resample_tensor_to_shape(
+    #         dino_warp_scores.detach().to(filtered_ssim_loss.device),
+    #         filtered_ssim_loss.shape,
+    #     )
+    #     # lambda_kin = 0.5
+    #     # kinematic_floor = -lambda_kin * torch.log(1.0 - kinematic_gate + 1e-3)
+    #     # filtered_ssim_loss = filtered_ssim_loss + kinematic_floor * filtered_ssim_loss.detach().mean()
+    #     filtered_ssim_loss = filtered_ssim_loss * torch.sqrt((1 + kinematic_gate)/2.0)
 
-    if dino_warp_scores is not None:
-        # ── Previous: cosine schedule with hardcoded bounds ──────────────────
-        w_min, w_max = 1.0, 1.5
-        log_sigma_weight = w_min + 0.5*(w_max - w_min)*(1.0 + torch.cos(pi*kinematic_gate))
+    # Adaptive Bayesian Prior: Modulate log(sigma) penalty using scaled tracker weights
+    if tracker_weight is not None:
+        w_resampled = resample_tensor_to_shape(
+            tracker_weight.detach().to(processed_uncertainty.device),
+            processed_uncertainty.shape,
+            "bilinear"
+        )
+        # formulation 4: lambda(W) = 1.0 + gamma * W
+        # gamma = 4.0 gives a 5x penalty ceiling on static backgrounds (W=1.0)
+        gamma = 2.0
+        log_sigma_weight = 1.0 + gamma * w_resampled
     else:
         log_sigma_weight = 1.0
 
@@ -355,7 +361,6 @@ def compute_mapping_loss_components(
 # Constants
 TOP_K_FEATURES = 128
 SIMILARITY_THRESHOLD = 0.75
-# EPSILON = torch.finfo(torch.float32).eps ## this is defined above
 
 
 def compute_dino_regularization_loss(

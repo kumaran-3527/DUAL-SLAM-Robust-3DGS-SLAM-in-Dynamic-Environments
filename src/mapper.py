@@ -132,12 +132,7 @@ class Mapper(object):
             self.uncer_optimizer = torch.optim.Adam([
                                                     {'params': list(self.uncer_network.net_fast.parameters()), 
                                                     'lr': base_lr, 
-                                                    'weight_decay': 1e-5}, 
-                                                    
-                                                    
-                                                    {'params': list(self.uncer_network.net_slow.parameters()), 
-                                                    'lr': base_lr*1.0, #0.8 
-                                                    'weight_decay': 1e-4}  #1e-4
+                                                    'weight_decay': 1e-5}
                                                     ])
 
             self.vis_uncertainty_online = self.uncer_params["vis_uncertainty_online"]
@@ -866,8 +861,8 @@ class Mapper(object):
             "features": features,
         }
 
-        # Using uncertainty only when uncertainty-aware tracking is activated
-        if self.video.uncertainty_aware:
+        # Using uncertainty only when uncertainty-aware tracking is activated and features are provided
+        if self.video.uncertainty_aware and features is not None:
             with torch.no_grad():
                 uncer, _ = self.uncer_network(features.to(color.device))
                 uncer = torch.clip(uncer, min=0.1) + 1e-3
@@ -1011,6 +1006,11 @@ class Mapper(object):
                     _scores = self.video.dino_warp_scores[viewpoint.uid]
                     if _scores[0, 0].item() != -1.0:
                         _dino_warp_scores = _scores.clone()
+                _geom_label = None
+                if hasattr(self.video, "geom_uncertainty_labels"):
+                    _label = self.video.geom_uncertainty_labels[viewpoint.uid]
+                    if _label[0, 0].item() != -1.0:
+                        _geom_label = _label.clone()
                 current_uncertainty, loss_init = get_loss_mapping_uncertainty(
                     self.config["mapping"],
                     image,
@@ -1022,6 +1022,7 @@ class Mapper(object):
                     ssim_frac,
                     initialization=True,
                     dino_warp_scores=_dino_warp_scores,
+                    geom_label=_geom_label,
                 )
 
                 stride = self.config["mapping"]["uncertainty_params"]["reg_stride"]
@@ -1036,8 +1037,7 @@ class Mapper(object):
                 ] * map_utils.compute_dino_regularization_loss(
                     uncer_buffer, feature_buffer
                 )
-                if hasattr(self.uncer_network, "distill_loss"):
-                    loss_init += 10.0 * self.uncer_network.distill_loss
+
 
             scaling = self.gaussians.get_scaling
             isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
@@ -1172,6 +1172,19 @@ class Mapper(object):
                     _scores = self.video.dino_warp_scores[viewpoint_kf_idx_stack[cam_idx]]
                     if _scores[0, 0].item() != -1.0:
                         _dino_warp_scores = _scores.clone()
+                _geom_label = None
+                if hasattr(self.video, "geom_uncertainty_labels"):
+                    _label = self.video.geom_uncertainty_labels[viewpoint_kf_idx_stack[cam_idx]]
+                    
+                    # ── Option B: Active Window Exclusion (Maturity Gating) ──
+                    # We ONLY distill if the frame has completely exited the Tracker's active 
+                    # optimization window (~25 frames). This shields the Mapper from early, erratic 
+                    # geometric masks caused by poor initial poses, ensuring it learns strictly 
+                    # from 100% frozen, perfectly converged ground-truth quality labels.
+                    is_mature = viewpoint_kf_idx_stack[cam_idx] < self.video.counter.value - 25
+                    
+                    if _label[0, 0].item() != -1.0 and is_mature:
+                        _geom_label = _label.clone()
                 (
                     current_uncertainty,
                     current_loss_mapping,
@@ -1185,10 +1198,10 @@ class Mapper(object):
                     train_frac,
                     ssim_frac,
                     dino_warp_scores=_dino_warp_scores,
+                    geom_label=_geom_label,
                 )
                 loss_mapping += current_loss_mapping
-                if hasattr(self.uncer_network, "distill_loss"):
-                    loss_mapping += 10.0 * self.uncer_network.distill_loss
+
 
                 # Dino_regularization loss
                 if self.iterations_after_densify_or_reset >= 20:
@@ -1353,6 +1366,11 @@ class Mapper(object):
                     _scores = self.video.dino_warp_scores[random_viewpoint_kf_idx_stack[rand_idx]]
                     if _scores[0, 0].item() != -1.0:
                         _dino_warp_scores = _scores.clone()
+                _geom_label = None
+                if hasattr(self.video, "geom_uncertainty_labels"):
+                    _label = self.video.geom_uncertainty_labels[random_viewpoint_kf_idx_stack[rand_idx]]
+                    if _label[0, 0].item() != -1.0:
+                        _geom_label = _label.clone()
                 (
                     current_uncertainty,
                     loss_mapping_this_frame,
@@ -1366,10 +1384,10 @@ class Mapper(object):
                     train_frac,
                     ssim_frac,
                     dino_warp_scores=_dino_warp_scores,
+                    geom_label=_geom_label,
                 )
                 loss_mapping += loss_mapping_this_frame
-                if hasattr(self.uncer_network, "distill_loss"):
-                    loss_mapping += 10.0 * self.uncer_network.distill_loss
+
 
                 stride = self.config["mapping"]["uncertainty_params"]["reg_stride"]
                 uncer_buffer.append(
@@ -1505,13 +1523,19 @@ class Mapper(object):
             return adjusted ** 2
 
         with Lock():
-            u_fast, u_slow = self.uncer_network(
+            u_fast, _ = self.uncer_network(
                 features,
                 dino_warp_scores=dino_warp_scores,
                 image_grad=viewpoint.grad_mask.to(features.device) if viewpoint.grad_mask is not None else None
             )
             stm = _process(u_fast)
-            ltm = _process(u_slow)
+            # Read the actual BA weights (uncertainties_inv) which range from 0.01 (dynamic) to 1.0 (static)
+            w_uncer = self.video.uncertainties_inv[viewpoint.uid].to(self.device)
+            # Invert the weight so that it visualizes like an uncertainty map:
+            # 1.0 (Safe background) -> 0.0 (Blue)
+            # 0.01 (Dynamic object) -> 0.99 (Red)
+            ltm_raw = 1.0 - w_uncer
+            ltm = map_utils.resample_tensor_to_shape(ltm_raw, target_shape)
 
         return stm, ltm
 
@@ -1619,10 +1643,10 @@ class Mapper(object):
         axs[1, 0].set_title("DINO Warping Score (SCE)", fontsize=16)
         
         axs[1, 1].imshow(stm_map, cmap='jet', vmin=0, vmax=5)
-        axs[1, 1].set_title("u_fast", fontsize=16)
+        axs[1, 1].set_title("Mapping Uncertainty", fontsize=16)
         
         axs[1, 2].imshow(ltm_map, cmap='jet', vmin=0, vmax=5)
-        axs[1, 2].set_title("u_slow", fontsize=16)
+        axs[1, 2].set_title("Tracking Uncertainty", fontsize=16)
         
         for i in range(2):
             for j in range(3):

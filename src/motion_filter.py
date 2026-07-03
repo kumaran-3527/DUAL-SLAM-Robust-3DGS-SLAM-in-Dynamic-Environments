@@ -6,6 +6,8 @@ from src.modules.droid_net import CorrBlock
 from src.utils.mono_priors.metric_depth_estimators import get_metric_depth_estimator, predict_metric_depth
 from src.utils.datasets import load_metric_depth, load_img_feature
 from src.utils.mono_priors.img_feature_extractors import predict_img_features, get_feature_extractor
+# from src.utils.mono_priors.img_feature_extractors_snd import get_feature_extractor, predict_img_features
+
 
 class MotionFilter:
     """ This class is used to filter incoming frames and extract features 

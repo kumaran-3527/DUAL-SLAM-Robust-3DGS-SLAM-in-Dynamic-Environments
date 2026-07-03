@@ -108,81 +108,101 @@ class AffineSlowNet(nn.Module):
         return x
 
 
-class SpatialSlowNet(nn.Module):
-    """
-    Spatial-aware slow uncertainty prior.
-    Uses depthwise-separable convolutions to achieve a large receptive field (9x9) 
-    with minimal FLOPs. This allows the network to bridge 'holes' in the dynamic mask 
-    left by the purely pixel-wise Fast MLP, producing smooth object-level masks
-    without being exposed to pixel-level rendering noise.
-    """
-    def __init__(self, input_dim=384, hidden_dim=96):
-        super().__init__()
-        # 1. Reduce dimensionality pixel-wise
-        self.conv1 = nn.Conv2d(input_dim, hidden_dim, kernel_size=1)
-        
-        # 2. Local spatial mixing (3x3 depthwise)
-        self.conv_dw1 = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=hidden_dim)
-        
-        # 3. Broad spatial mixing (5x5 dilated by 2 -> 9x9 receptive field)
-        self.conv_dw2 = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=5, padding=4, dilation=2, groups=hidden_dim)
-        
-        # 4. Project to uncertainty
-        self.conv2 = nn.Conv2d(hidden_dim, 1, kernel_size=1)
-        
-        self.softplus = nn.Softplus()
-        
-        # Initialize
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-    def forward(self, x):
-        # Input: [B, H, W, C] or [H, W, C]
-        has_batch = (x.dim() == 4)
-        if not has_batch:
-            x = x.unsqueeze(0)
-            
-        # Permute to [B, C, H, W] for Conv2d
-        x = x.permute(0, 3, 1, 2).contiguous()
-        
-        # Forward pass through spatial mixer
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv_dw1(x))
-        x = F.relu(self.conv_dw2(x))
-        x = self.softplus(self.conv2(x))
-        
-        # Permute back and strip channel dim: [B, 1, H, W] -> [B, H, W]
-        x = x.squeeze(1)
-        if not has_batch:
-            x = x.squeeze(0)
-            
-        return x
-
 
 class FirstPrinciplesUncertaintyModel(nn.Module):  
     def __init__(self, input_dim=384):
         super().__init__()
         self.net_fast = MLPNetwork(input_dim=input_dim, net_depth=2)
-        # Lightweight spatial slow prior for smooth object-level tracking masks.
-        self.net_slow = AffineSlowNet(input_dim=input_dim)
-        self.distill_loss = 0.0
 
     def forward(self, x, dino_warp_scores=None, image_grad=None):
         u_fast = self.net_fast(x)
-        u_slow = self.net_slow(x)
+        return u_fast, None
+
+
+class TrackerSlowNet(nn.Module):
+    """Single-layer network for tracker-side uncertainty.
+    Trained inside ba() using SCE NLL formulation.
+    """
+    def __init__(self, input_dim=384):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(input_dim, 1),
+            # nn.SiLU(),
+            # nn.Linear(64, 1)
+        )
+        nn.init.kaiming_normal_(self.fc[0].weight,mode='fan_in', nonlinearity='linear')
+        nn.init.kaiming_normal_(self.fc[0].bias,mode='fan_in', nonlinearity='linear')
+        # nn.init.xavier_uniform_(self.fc[2].weight)
+        # nn.init.constant_(self.fc[2].bias, 0.0)
+
+        self.softplus = nn.Softplus()
+
+    def forward(self, x):
+        # x: [B, H, W, C] or [H, W, C]
+        has_batch = (x.dim() == 4)
+        if not has_batch:
+            x = x.unsqueeze(0)
+        B, H, W, C = x.shape
+        x = x.reshape(-1, C)
+        x = self.fc(x)
+        x = self.softplus(x)
         
-        if self.training:
-            if dino_warp_scores is not None:
-                target = u_fast.detach()
-                self.distill_loss = F.smooth_l1_loss(u_slow, target, beta=0.01) 
-            else: 
-                self.distill_loss = F.smooth_l1_loss(u_slow, u_fast.detach(), beta=0.1)
-        else:
-            self.distill_loss = 0.0
-        return u_fast, u_slow
+        return x.view(B, H, W) if has_batch else x.view(H, W)
+
+
+class LoRATrackerNet(nn.Module):
+    """
+    Tracker-side uncertainty network using Low-Rank Adaptation (LoRA).
+    It wraps the mapper's base MLPNetwork and injects low-rank perturbations 
+    during tracking to rapidly fit geometric motion without destroying the base prior.
+    """
+    def __init__(self, base_net: nn.Module, rank: int = 4):
+        super().__init__()
+        self.base_net = base_net
+        self.rank = rank
+        
+        self.lora_A = nn.ParameterList()
+        self.lora_B = nn.ParameterList()
+        
+        # base_net is an MLPNetwork
+        for layer in self.base_net.layers:
+            self.lora_A.append(nn.Parameter(torch.zeros(rank, layer.in_features)))
+            self.lora_B.append(nn.Parameter(torch.zeros(layer.out_features, rank)))
+            
+        self.lora_out_A = nn.Parameter(torch.zeros(rank, self.base_net.output_layer.in_features))
+        self.lora_out_B = nn.Parameter(torch.zeros(self.base_net.output_layer.out_features, rank))
+        
+        for a in self.lora_A:
+            nn.init.kaiming_normal_(a, mode='fan_in', nonlinearity='linear')
+        for b in self.lora_B:
+            nn.init.zeros_(b)
+            
+        nn.init.kaiming_normal_(self.lora_out_A, mode='fan_in', nonlinearity='linear')
+        nn.init.zeros_(self.lora_out_B)
+        
+        self.softplus = nn.Softplus()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        has_batch = (x.dim() == 4)
+        if not has_batch:
+            x = x.unsqueeze(0)
+        B, H, W, C = x.shape
+        x = x.reshape(-1, C)
+        
+        for i, layer in enumerate(self.base_net.layers):
+            base_out = layer(x)
+            lora_out = F.linear(F.linear(x, self.lora_A[i]), self.lora_B[i])
+            x = base_out + lora_out
+            x = self.base_net.net_activation(x)
+            # dropout is disabled during tracking due to eval() or just implicitly
+        
+        base_out = self.base_net.output_layer(x)
+        lora_out = F.linear(F.linear(x, self.lora_out_A), self.lora_out_B)
+        x = base_out + lora_out
+        x = self.softplus(x)
+
+        return x.view(B, H, W) if has_batch else x.view(H, W)
+
 
 
 '''
