@@ -82,31 +82,6 @@ def generate_uncertainty_mlp(n_features: int):
 
 
 
-class AffineSlowNet(nn.Module):
-    """Single-layer affine transform for slow uncertainty prior.
-    384 -> 96 -> 1, with Softplus output.
-    Much simpler than the Fast MLP; designed for smooth, generalisable priors.
-    """
-    def __init__(self, input_dim=384, hidden_dim=64):
-        super().__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, 1)
-        nn.init.kaiming_uniform_(self.fc1.weight, nonlinearity='relu')
-        nn.init.kaiming_uniform_(self.fc2.weight, nonlinearity='relu')
-        self.softplus = nn.Softplus()
-
-    def forward(self, x):
-        H, W, C = x.shape[-3:]
-        has_batch = (x.dim() == 4)
-        if not has_batch:
-            x = x.unsqueeze(0)
-        B = x.shape[0]
-        x = x.view(-1, C)
-        x = F.relu(self.fc1(x))
-        x = self.softplus(self.fc2(x))
-        x = x.view(B, H, W) if has_batch else x.view(H, W)
-        return x
-
 
 
 class FirstPrinciplesUncertaintyModel(nn.Module):  
@@ -114,40 +89,12 @@ class FirstPrinciplesUncertaintyModel(nn.Module):
         super().__init__()
         self.net_fast = MLPNetwork(input_dim=input_dim, net_depth=2)
 
-    def forward(self, x, dino_warp_scores=None, image_grad=None):
+    def forward(self, x):
         u_fast = self.net_fast(x)
         return u_fast, None
 
 
-class TrackerSlowNet(nn.Module):
-    """Single-layer network for tracker-side uncertainty.
-    Trained inside ba() using SCE NLL formulation.
-    """
-    def __init__(self, input_dim=384):
-        super().__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(input_dim, 1),
-            # nn.SiLU(),
-            # nn.Linear(64, 1)
-        )
-        nn.init.kaiming_normal_(self.fc[0].weight,mode='fan_in', nonlinearity='linear')
-        nn.init.kaiming_normal_(self.fc[0].bias,mode='fan_in', nonlinearity='linear')
-        # nn.init.xavier_uniform_(self.fc[2].weight)
-        # nn.init.constant_(self.fc[2].bias, 0.0)
 
-        self.softplus = nn.Softplus()
-
-    def forward(self, x):
-        # x: [B, H, W, C] or [H, W, C]
-        has_batch = (x.dim() == 4)
-        if not has_batch:
-            x = x.unsqueeze(0)
-        B, H, W, C = x.shape
-        x = x.reshape(-1, C)
-        x = self.fc(x)
-        x = self.softplus(x)
-        
-        return x.view(B, H, W) if has_batch else x.view(H, W)
 
 
 class LoRATrackerNet(nn.Module):
@@ -205,107 +152,7 @@ class LoRATrackerNet(nn.Module):
 
 
 
-'''
-class EMAUncertaintyModel(nn.Module):  
-    def __init__(self, input_dim=384, ema_momentum=0.999):
-        super().__init__()
-   
-        self.net_fast = MLPNetwork(input_dim=input_dim, net_depth=2)
-        self.net_slow = MLPNetwork(input_dim=input_dim, net_depth=2)
-    
-        for param in self.net_slow.parameters():
-            param.requires_grad = True
-        self.distill_loss = 0.0
-        self.register_buffer("u_baseline", torch.tensor(0.15))
-        
-        # Track statistics for analytical CDF Matching (Z-Score Alignment)
-        # self.register_buffer("mu_fast", torch.tensor(0.15))
-        # self.register_buffer("var_fast", torch.tensor(0.01))
-        self.register_buffer("mu_slow", torch.tensor(0.15))
-        self.register_buffer("var_slow", torch.tensor(0.01))
 
-    def forward(self, x, dino_warp_scores=None, image_grad=None):
-       
-        u_fast = self.net_fast(x)
-        u_slow = self.net_slow(x)
-        if self.training:
-            if dino_warp_scores is not None and image_grad is not None:
-                with torch.no_grad():
-                    self.mu_slow.data = 0.99 * self.mu_slow.data + 0.01 * u_slow.mean()
-                    self.var_slow.data = 0.99 * self.var_slow.data + 0.01 * u_slow.var(unbiased=False)
-
-                H_dino, W_dino = x.shape[-3], x.shape[-2]
-                
-                # Pool DINOv2 warping Semantic Consistency Error (SCE) and image gradient
-                M = F.adaptive_avg_pool2d(
-                    dino_warp_scores.float().unsqueeze(0).unsqueeze(0) if dino_warp_scores.dim() == 2 else dino_warp_scores.float().unsqueeze(1),
-                    (H_dino, W_dino)
-                )
-                M = M.squeeze(0).squeeze(0) if dino_warp_scores.dim() == 2 else M.squeeze(1)
-                # M = diffuse_uncertainty(M, x, theta_sim=0.80)
-
-                G = F.adaptive_avg_pool2d(
-                    image_grad.float().unsqueeze(0) if image_grad.dim() == 3 else image_grad.float(),
-                    (H_dino, W_dino)
-                )
-                G = G.squeeze(0).squeeze(0) if image_grad.dim() == 3 else G.squeeze(1)
-                
-                static_mask = (1.0 - M)
-                if static_mask.sum() > 0:
-                    current_static_u = (u_fast.detach() * static_mask).sum() / static_mask.sum()
-                    self.u_baseline.data = 0.99 * self.u_baseline.data + 0.01 * current_static_u
-                    
-                W_dynamic = M
-                dyn_floor = 0.5
-                T_dynamic = u_fast.detach() + (M * dyn_floor) * (1 - u_fast.detach())    
-
-                W_static_texture = (1.0 - M) * G
-                T_static_texture = torch.full_like(u_fast, self.u_baseline.item())
-                
-                C_photo = torch.exp(-u_fast.detach())
-                W_general = (1.0 - M) * (1.0 - G) * C_photo
-                T_general = u_fast.detach()
-                
-                lambda_acquire = 1.0
-                lambda_forget = 0.002
-                alpha = 20.0  # Sharpness of transition
-
-                u_slow_detached = u_slow.detach()
-
-                delta_dyn = T_dynamic - u_slow_detached
-                # lambda_dyn = lambda_forget + (lambda_acquire - lambda_forget) * torch.sigmoid(alpha * delta_dyn)
-                lambda_dyn = 1.0
-                distill_dynamic = W_dynamic * lambda_dyn * (u_slow - T_dynamic).pow(2)
-
-                delta_stat = T_static_texture - u_slow_detached
-                lambda_stat = lambda_forget + (lambda_acquire - lambda_forget) * torch.sigmoid(alpha * delta_stat)
-                distill_static_texture = W_static_texture * lambda_stat * (u_slow - T_static_texture).pow(2)
-
-                delta_gen = T_general - u_slow_detached
-                lambda_gen = lambda_forget + (lambda_acquire - lambda_forget) * torch.sigmoid(alpha * delta_gen)
-                distill_general = W_general * lambda_gen * (u_slow - T_general).pow(2)
-
-                self.distill_loss = (distill_dynamic + distill_static_texture + distill_general).mean()
-            else:
-                weight = torch.exp(-u_fast.detach())
-                self.distill_loss = (weight * (u_slow - u_fast.detach()).pow(2)).mean()
-        else:
-            self.distill_loss = 0.0
-            
-    
-        # # Z-Space Contrast Stretching: Push high uncertainties higher
-        # # In standardized Z-space, the noise floor (mean) is precisely 0.0.
-        # std_slow = torch.sqrt(self.var_slow + 1e-6)
-        # z_slow = (u_slow - self.mu_slow) / std_slow
-        
-        # # Only stretch confidently high uncertainties (z > 1.0). 
-        # # This prevents negative z-values (low uncertainty) from becoming positive,
-        # # and avoids shrinking/stretching values in the middle (-1.0 to 1.0).
-        # z_slow = z_slow * torch.abs(z_slow)
-        # u_slow = z_slow * std_slow + self.mu_slow
-        
-        return u_fast, u_slow, u_fast
-'''
 
 
 

@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import lietorch
 import droid_backends
+import mfc_backends
 import src.geom.ba
 from torch.multiprocessing import Value
 from torch.multiprocessing import Lock
@@ -83,17 +84,15 @@ class DepthVideo:
             self.mapping_uncertainties_inv = torch.ones(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
             
             
-            # DINOv2 warping Semantic Consistency Error (SCE) per keyframe at 1/8 resolution.
-            # Aggregated across all BA edges touching each frame during ba().
-            self.dino_warp_scores = torch.zeros(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
+
             # Experience Replay: geometric pseudo-labels from tracker (sentinel: -1.0 = not yet computed)
             self.geom_uncertainty_labels = -1.0 * torch.ones(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
             # SCE scheduling: run on new-keyframe events and every SCE_STRIDE BA calls.
             self._sce_ba_call_count = 0
             self._sce_new_frame_pending = False
-            self.SCE_STRIDE = 2           # recompute every N BA calls (tune: 2-8)
-            self.SCE_MIN_GAP = 0     # skip stereo pairs and adjacent frames
-            self.SCE_MAX_GAP = 4   # since this counts keyframes not frames larger values can lead to huge viewpoint changes
+            # self.SCE_STRIDE = 2           # recompute every N BA calls (tune: 2-8)
+            # self.SCE_MIN_GAP = 0     # skip stereo pairs and adjacent frames
+            # self.SCE_MAX_GAP = 4   # since this counts keyframes not frames larger values can lead to huge viewpoint changes
             
             self.use_sce_init_gate = cfg['tracking']["uncertainty_params"].get('use_sce_init_gate', False)
             self.cached_sce_f = None
@@ -101,35 +100,18 @@ class DepthVideo:
             self.cached_jj_filtered = None
 
             from src.utils.dyn_uncertainty.uncertainty_model import LoRATrackerNet
-            lora_rank = cfg['tracking']['uncertainty_params'].get('lora_rank',8)
-            lora_lr = cfg['tracking']['uncertainty_params'].get('lora_lr',4e-7) #0.0000001 or 4e-7, 4e-8
-            # With lambda_prior = 0.0, we need a moderate AdamW weight decay (1.0) 
-            # to act as a gentle parameter-space "forgetting" mechanism, but we keep it small (0.05)
-            # because the inactive edges provide plenty of natural stability.
+            lora_rank = cfg['tracking']['uncertainty_params'].get('lora_rank', 8) #4
+            lora_lr = cfg['tracking']['uncertainty_params'].get('lora_lr',4e-7) # 4e-7, 
             lora_wd = cfg['tracking']['uncertainty_params'].get('lora_wd', 0.1)
+            
             self.tracker_net = LoRATrackerNet(base_net=self.uncer_network.net_fast, rank=lora_rank).to(self.device)
             # Only optimize the LoRA parameters (A and B matrices)
             lora_params = [p for n, p in self.tracker_net.named_parameters() if 'lora_' in n]
             self.tracker_optimizer = torch.optim.AdamW(
                 lora_params, lr=lora_lr, weight_decay=lora_wd
             )
-          
+        
 
-            # --- NEW SINGLE-LAYER NETWORK ---
-            # import torch.nn as nn
-            # self.tracker_net = nn.Sequential(
-            #     nn.Linear(384, 64),
-            #     nn.ReLU(),
-            #     nn.Linear(64, 1),
-            #     nn.Softplus()
-            # ).to(self.device)
-            
-            # lora_lr = cfg['tracking']['uncertainty_params'].get('lora_lr', 1e-3)
-            # lora_wd = cfg['tracking']['uncertainty_params'].get('lora_wd', 1e-2)
-            # self.tracker_optimizer = torch.optim.Adam(
-            #     self.tracker_net.parameters(), lr=lora_lr, weight_decay=lora_wd
-            # )
-            # # --------------------------------
             self._tracker_net_trained = False
             self.is_initialized = False
             self.is_initialized_fully = False
@@ -365,49 +347,56 @@ class DepthVideo:
         # projected point is valid only if its inside the image range and the depth is greater than 0
         valid_mask = (x1_rounded[..., 1] >= 0) & (x1_rounded[..., 1] < x1.shape[2]) & \
                     (x1_rounded[..., 0] >= 0) & (x1_rounded[..., 0] < x1.shape[3]) & (x1[...,2]>0)
+        import mfc_backends
+
+        # We need jj features. jj is a tensor of indices.
+        # feats_jj shape: [E, 384, H_feat, W_feat]
+        feats_jj = self.dino_feats[jj.cpu()].permute(0, 3, 1, 2).to(self.device)
+        feats_jj = F.normalize(feats_jj, p=2, dim=1).contiguous()
         
-        i_dino = F.interpolate(self.dino_feats[idx].permute(2,0,1).unsqueeze(0),
-                                self.disps_up.shape[-2:], 
-                                mode='bilinear').to(self.device).squeeze()
+        # We need ii features. ii is idx repeated E times.
+        feats_ii = self.dino_feats[ii.cpu()].permute(0, 3, 1, 2).to(self.device)
+        feats_ii = F.normalize(feats_ii, p=2, dim=1).contiguous()
+
+        # x1 is [1, E, H_full, W_full, 3] -> [E, H_full, W_full, 3]
+        x1_b = x1[0].contiguous()
+        valid_mask_b = valid_mask[0].contiguous()
+
+        # Execute fused zero-VRAM CUDA operation to get similarity > 0.9 mask!
+        # Remember: we pass feats_jj first (sampled at px,py) and feats_ii second (sampled at w,h)
+        matching_mask = mfc_backends.sce_feature_warp_full_res(
+            feats_jj, 
+            feats_ii, 
+            x1_b,
+            valid_mask_b
+        )
+
+        # matching_mask is [E, H, W]
+        # For each E, we have a set of matched pixels in frame i.
+        # The coordinates in frame i are x1_rounded[..., 0] and x1_rounded[..., 1].
+        x1_rounded = torch.round(x1_b[..., :2]).long()
+        
         for j_id in range(jj.shape[0]):
-            projected_j_to_i = x1[0, j_id]
-            x_coords, y_coords = x1_rounded[0, j_id, ..., 0], x1_rounded[0, j_id, ..., 1]
+            m_mask = matching_mask[j_id] & valid_mask_b[j_id]
             
-            # Select valid coordinates and their Dino features
-            j_dino = F.interpolate(self.dino_feats[jj[j_id]].permute(2,0,1).unsqueeze(0),
-                                    self.disps_up.shape[-2:], 
-                                    mode='bilinear').to(self.device).squeeze()
-            valid_x, valid_y = x_coords[valid_mask[0, j_id]], y_coords[valid_mask[0, j_id]]
-            src_y, src_x = torch.where(valid_mask[0, j_id])
-
-            # Compute cosine similarity for each valid position in chunks to avoid CUDA OOM
-            num_valid = valid_x.shape[0]
-            similarity = torch.zeros(num_valid, device=self.device, dtype=torch.float32)
-            pixel_chunk_size = 50000
-            for chunk_start in range(0, num_valid, pixel_chunk_size):
-                chunk_end = min(num_valid, chunk_start + pixel_chunk_size)
-                
-                j_dino_chunk = j_dino[:, src_y[chunk_start:chunk_end], src_x[chunk_start:chunk_end]]
-                i_dino_chunk = i_dino[:, valid_y[chunk_start:chunk_end], valid_x[chunk_start:chunk_end]]
-                
-                sim_chunk = F.normalize(j_dino_chunk, p=2, dim=0).mul(F.normalize(i_dino_chunk, p=2, dim=0)).sum(dim=0)
-                similarity[chunk_start:chunk_end] = sim_chunk
-
-            matching_mask = similarity > 0.9
-
-            # Update projected disparity and counts based on the similarity check
-            j_projected_disp = torch.zeros_like(self.mono_disps_up[idx])
-            matched_disp = projected_j_to_i[valid_mask[0, j_id]][matching_mask]
-            matched_x, matched_y = valid_x[matching_mask], valid_y[matching_mask]
-            j_projected_disp[matched_y, matched_x] = matched_disp[..., 2]
-
-            # Error calculation and count updates
-            error = torch.abs(1 / j_projected_disp[matched_y, matched_x] - 1 / i_disp[matched_y, matched_x]) * j_projected_disp[matched_y, matched_x]
+            # Extract the 2D spatial planes for coordinates and depth
+            x_coords = x1_rounded[j_id, ..., 0]
+            y_coords = x1_rounded[j_id, ..., 1]
+            depth_plane = x1_b[j_id, ..., 2]
+            
+            # Apply the boolean mask to get valid 1D arrays
+            valid_x = x_coords[m_mask]
+            valid_y = y_coords[m_mask]
+            depth_j = depth_plane[m_mask]
+            
+            # We compare depth_j against i_disp at (valid_x, valid_y)
+            depth_i = i_disp[valid_y, valid_x]
+            
+            error = torch.abs(1.0 / depth_j - 1.0 / depth_i) * depth_j
             correct_mask = error < 0.02
-
-            # Batch update correct and bad counts
-            accurate_count[matched_y[correct_mask], matched_x[correct_mask]] += 1
-            inaccurate_count[matched_y[~correct_mask], matched_x[~correct_mask]] += 1
+            
+            accurate_count[valid_y[correct_mask], valid_x[correct_mask]] += 1
+            inaccurate_count[valid_y[~correct_mask], valid_x[~correct_mask]] += 1
 
         # Clean the gpu memory
         torch.cuda.empty_cache()
@@ -419,9 +408,7 @@ class DepthVideo:
            motion_only=False, global_ba=False):
 
         if self.uncertainty_aware:
-            if not self._tracker_net_trained or motion_only:
-                # Use Mapper uncertainty during warmup, OR when filling non-keyframes 
-                # (motion_only=True) since the Tracker's LoRA state is ephemeral and local.
+            if not getattr(self, 'is_initialized', False) or motion_only or not self._tracker_net_trained:
                 u_inv_i = self.mapping_uncertainties_inv[ii][None, :, :, :, None]
                 weight *= u_inv_i
             else:
@@ -474,14 +461,6 @@ class DepthVideo:
             self.disps.clamp_(min=1e-5)
 
             # ── Semantic Consistency Error (SCE) via DINOv2 Warping ──
-            # After BA updates poses/disps, we warp the semantic DINOv2 features
-            # to check for rigid-semantic inconsistency. Moving objects violate 
-            # the static world assumption, causing high SCE at object boundaries.
-            #
-            # Scheduling: since motion_only is never actually True in the call chain
-            # (frontend and backend always pass motion_only=False), we gate on:
-            #   (a) a new keyframe was just confirmed (_sce_new_frame_pending=True), OR
-            #   (b) every SCE_STRIDE ba calls elapsed.
             if self.uncertainty_aware:
 
                 _run_sce = not global_ba
@@ -490,7 +469,6 @@ class DepthVideo:
                     self._sce_new_frame_pending = False
                     with torch.no_grad():
                         # We consider ALL edges (both active and inactive) passed to ba()
-                        # as long as they fall within the valid initialized frame range [0, t1)
                         window_mask = (ii >= 0) & (jj >= 0) & (ii < t1) & (jj < t1)
                         ii_active = ii[window_mask]
                         jj_active = jj[window_mask]
@@ -559,82 +537,48 @@ class DepthVideo:
                             grid = x1.clone()  # [E_f, H_s, W_s, 2]
                             grid[..., 0] = 2.0 * grid[..., 0] / (W_s - 1) - 1.0
                             grid[..., 1] = 2.0 * grid[..., 1] / (H_s - 1) - 1.0
-
+                            
                             # ── Condition 3: Cosine Similarity with Clamping & Threshold ──
-                            E_f = len(ii_filtered)
-                            chunk_size = 16
-                            sce_f = torch.zeros(E_f, H_s, W_s, device=self.device, dtype=torch.float32)
+                            jj_cpu = jj_filtered.cpu()
+                            ii_cpu = ii_filtered.cpu()
 
-                            for chunk_start in range(0, E_f, chunk_size):
-                                chunk_end = min(E_f, chunk_start + chunk_size)
+                            feats_jj = self.dino_feats_resize[jj_cpu].to(self.device)
+                            feats_ii = self.dino_feats_resize[ii_cpu].to(self.device)
 
-                                jj_chunk = jj_filtered[chunk_start:chunk_end].cpu()
-                                ii_chunk = ii_filtered[chunk_start:chunk_end].cpu()
+                            # L2-normalize along the channel dim for true cosine similarity
+                            feats_jj = F.normalize(feats_jj, p=2, dim=1)
+                            feats_ii = F.normalize(feats_ii, p=2, dim=1)
 
-                                feats_jj_chunk = self.dino_feats_resize[jj_chunk].to(self.device)
-                                feats_ii_chunk = self.dino_feats_resize[ii_chunk].to(self.device)
+                            # --- NEW CUDA IMPLEMENTATION ---
+                            # The fused kernel handles bilinear interpolation, dot product, clamping, 
+                            # thresholding, and geometric validity masking without intermediate VRAM allocations!
+                            # Now executed in a single pass for maximum speed (chunking removed)!
+                            sce_f = mfc_backends.sce_feature_warp(
+                                feats_ii, feats_jj, grid, geom_valid
+                            )
 
-                                # L2-normalize along the channel dim for true cosine similarity
-                                feats_jj_chunk = F.normalize(feats_jj_chunk, p=2, dim=1)
-                                feats_ii_chunk = F.normalize(feats_ii_chunk, p=2, dim=1)
-
-                                grid_chunk = grid[chunk_start:chunk_end]
-
-                                # Bilinear interpolation of target features at projected coords
-                                warped_chunk = F.grid_sample(
-                                    feats_jj_chunk, grid_chunk,
-                                    mode='bilinear', padding_mode='zeros', align_corners=True
-                                )
-
-                                # Cosine similarity = dot product (already L2-normalized)
-                                cos_sim = (feats_ii_chunk * warped_chunk).sum(dim=1)  # [chunk, H_s, W_s]
-
-                                # Clamp to [0, 1] to reject outlier negative similarities
-                                cos_sim = torch.clamp(cos_sim, min=0.0, max=1.0)
-
-                               # Hard threshold: zero out low-confidence matches (<= 0.5)
-                                cos_sim = torch.where(
-                                    cos_sim >= 0.50, cos_sim, torch.zeros_like(cos_sim)
-                                )
-                        
-
-                                # SCE = 1 - cosine_similarity (high SCE = semantically inconsistent)
-                                sce_f[chunk_start:chunk_end] = 1.0 - cos_sim
-
-                            # Zero out pixels that failed geometric validity
-                            sce_f[~geom_valid] = 0.0
-
-                            # ── Fully Vectorized Aggregation (CUDA) ──────────────────────
-                            # We replace all Python dictionary groupings and for-loops with 
-                            # PyTorch scatter operations. This avoids launching hundreds of 
-                            # tiny CUDA kernels and pushes the entire aggregation to the GPU.
-                            
-                            N = self.counter.value
-                            delta = torch.clamp(torch.abs(ii_filtered - jj_filtered), min=1)
-                            edge_weights = (1.0 / delta.float()).view(-1, 1, 1)  # [E, 1, 1]
-                            
-                            # Valid weights and masked SCE
-                            valid_mask = geom_valid.float()  # [E, H_s, W_s]
-                            weighted_sce = sce_f * edge_weights * valid_mask
-                            weight_contrib = edge_weights * valid_mask
-
-                            # Scatter add aggregation
-                            out_sce = torch.zeros(N, H_s, W_s, device=self.device)
-                            out_weight = torch.zeros(N, H_s, W_s, device=self.device)
-                            
-                            idx = ii_filtered.view(-1, 1, 1).expand(-1, H_s, W_s)
-                            out_sce.scatter_add_(0, idx, weighted_sce)
-                            out_weight.scatter_add_(0, idx, weight_contrib)
-                            
-                            frame_sce = out_sce / out_weight.clamp(min=1e-6)
-
-                            clamped_sce = torch.clamp(frame_sce, 0.0, 1.0)
-
-                            # ONLY update frames that were actively evaluated in this BA window
-                            # This preserves historical scores for frames that weren't touched
-                            active_srcs = torch.unique(ii_filtered)
-                            if len(active_srcs) > 0:
-                                self.dino_warp_scores[active_srcs] = clamped_sce[active_srcs]
+                            # --- OLD PYTORCH IMPLEMENTATION ---
+                            # # Bilinear interpolation of target features at projected coords
+                            # warped = F.grid_sample(
+                            #     feats_jj, grid,
+                            #     mode='bilinear', padding_mode='zeros', align_corners=True
+                            # )
+                            #
+                            # # Cosine similarity = dot product (already L2-normalized)
+                            # cos_sim = (feats_ii * warped).sum(dim=1)  # [E_f, H_s, W_s]
+                            #
+                            # # Clamp to [0, 1] to reject outlier negative similarities
+                            # cos_sim = torch.clamp(cos_sim, min=0.0, max=1.0)
+                            #
+                            # # Hard threshold: zero out low-confidence matches (<= 0.5)
+                            # cos_sim = torch.where(
+                            #     cos_sim >= 0.50, cos_sim, torch.zeros_like(cos_sim)
+                            # )
+                            #
+                            # # SCE = 1 - cosine_similarity (high SCE = semantically inconsistent)
+                            # sce_f = 1.0 - cos_sim
+                            # # Zero out pixels that failed geometric validity
+                            # sce_f[~geom_valid] = 0.0
 
                             if self.use_sce_init_gate and not self.is_initialized_fully:
                                 self.cached_sce_f = sce_f.detach().clone()
@@ -642,97 +586,105 @@ class DepthVideo:
                                 self.cached_jj_filtered = jj_filtered.clone()
 
                             with torch.enable_grad():
-                                # ONLY train the tracker after the graph has stabilized (warmup is complete)
-                                if self.is_initialized_fully and hasattr(self, 'tracker_net') and len(ii_filtered) > 0:
+                                # Train the tracker dynamically during Stage 1, Stage 2, and normal tracking
+                                if hasattr(self, 'tracker_net') and len(ii_filtered) > 0:
+                                    
+                                    if self.cfg['tracking']['uncertainty_params'].get('freeze_base', False):
+                                        import copy
+                                        self.tracker_net.base_net = copy.deepcopy(self.uncer_network.net_fast)
+                                        self.tracker_net.base_net.requires_grad_(False)
+                                        self.tracker_net.base_net.eval()
+
                                     self.tracker_net.train()
                                     unique_srcs = torch.unique(ii_filtered)
-                                    total_loss = 0.0
-                                    total_reg_loss = 0.0
-                                    n_frames = 0
-                                    for src_idx in unique_srcs:
-                                        src = src_idx.item()
-                                        edge_mask = (ii_filtered == src_idx)
-                                        feats = self.dino_feats_resize[src].to(self.device)
-                                        feats_hw = feats.permute(1, 2, 0)
+                                    
+                                    if len(unique_srcs) > 0:
+                                        feats_b = self.dino_feats_resize[unique_srcs.cpu()].to(self.device)
+                                        feats_bhwc = feats_b.permute(0, 2, 3, 1)  # [N, H, W, C]
+                                        u_finals_b = self.tracker_net(feats_bhwc) # [N, H_s, W_s]
                                         
-        
-                                        with torch.no_grad():
-                                            u_map = self.uncer_network.net_fast(feats_hw).view(H_s, W_s)
-                                        
-                                        # 2. Get final combined prediction from Tracker (which internally adds LoRA to base)
-                                        u_final = self.tracker_net(feats_hw).view(H_s, W_s)
-                                        
-                                        # 4. Filter for valid edges
-                                        sce_src = sce_f[edge_mask]
-                                        valid_src = geom_valid[edge_mask]
-                                        
-                                        # Broadcast uncertainty maps along the edge dimension [1, H_s, W_s]
-                                        u_final_b = u_final.unsqueeze(0)
-                                        u_map_b = u_map.unsqueeze(0)
-                                        
-                                        # 5. Observation Likelihood (Geometry / SCE)
-                                        L_obs = (sce_src / (u_final_b**2 + 1e-6)) + torch.log(u_final_b + 1e-6)
-                                        
-                                        # 6. Prior Likelihood (Log-Normal Photometric Anchor)
-                                        # lambda_prior controls how strictly the Tracker must adhere to the Mapper's belief
-                                        lambda_prior = 0.0
-                                        L_prior = lambda_prior * (torch.log(u_final_b + 1e-6) - torch.log(u_map_b + 1e-6))**2
-                                        
-                                        # 7. Total NLL
-                                        nll = (L_obs + L_prior) * valid_src
-                                        n_valid = valid_src.sum().clamp(min=1.0)
-                                        
-                                        total_loss += nll.sum() / n_valid
-                                        n_frames += 1
-
-                                    if n_frames > 0:
-                                        # Sum across frames (no / n_frames). Each frame's NLL is already
-                                        # per-pixel via / n_valid. More frames = more evidence = stronger update.
+                                        total_loss = 0.0
+                                        for batch_idx, src_idx in enumerate(unique_srcs):
+                                            edge_mask = (ii_filtered == src_idx)
+                                            u_final = u_finals_b[batch_idx]
+                                            
+                                            sce_src = sce_f[edge_mask]
+                                            valid_src = geom_valid[edge_mask]
+                                            u_final_b = u_final.unsqueeze(0)
+                                            
+                                            L_obs = (sce_src / (u_final_b**2 + 1e-6)) + torch.log(u_final_b + 1e-6)
+                                            nll = L_obs * valid_src
+                                            n_valid = valid_src.sum().clamp(min=1.0)
+                                            total_loss += nll.sum() / n_valid
+                                            
                                         # L2 weight decay on the A,B matrices acts as the native regularizer against the mapper.
                                         self.tracker_optimizer.zero_grad()
                                         total_loss.backward()
                                         self.tracker_optimizer.step()
-                                    
+                                        
                                     self.tracker_net.eval()
                                     self._tracker_net_trained = True
 
                                     # Experience Replay: save geometric pseudo-labels and immediate inference
-                                    if hasattr(self, 'geom_uncertainty_labels') and self.is_initialized_fully:
+                                    if hasattr(self, 'geom_uncertainty_labels') and len(unique_srcs) > 0:
                                         with torch.no_grad():
-                                            for src_idx in unique_srcs:
+                                            # --- BATCHED FORWARD PASS (INFERENCE) ---
+                                            # We re-run batched inference in eval() mode just to be structurally safe
+                                            u_finals_eval = self.tracker_net(feats_bhwc)
+                                            
+                                            m_scale = 45.0
+                                            c_scale = 35.5
+                                            u_finals_scaled = torch.clamp(m_scale * u_finals_eval - c_scale, min=0.1)
+                                            w_uncers = torch.clamp(0.5 / (u_finals_scaled**2 + 1e-6), min=0.01, max=1.0)
+                                            
+                                            for batch_idx, src_idx in enumerate(unique_srcs):
                                                 src = src_idx.item()
-                                                feats = self.dino_feats_resize[src].to(self.device)
-                                                feats_hw = feats.permute(1, 2, 0)
-                                                
-                                                u_final = self.tracker_net(feats_hw).view(H_s, W_s)
-                                                
-                                                # Store raw σ for distillation (same space as Mapper's u_map)
-                                                self.geom_uncertainty_labels[src] = u_final
-                                                
-                                                # # Optional periodic print statement
-                                                # self._print_uncer_counter = getattr(self, '_print_uncer_counter', 0) + 1
-                                                # if self._print_uncer_counter % 10 == 0:
-                                                #     from src.utils.Printer import FontColor
-                                                #     print(f"{FontColor.INFO}Tracker Stats - Min: {u_final.min().item():.3f}, Max: {u_final.max().item():.3f}, Mean: {u_final.mean().item():.3f}")
-                                                
-                                                # # Gaussian precision: 0.5/u² (unified with Mapper's convention)
-                                                # u ≤ 0.707 → weight 1.0 (background safe)
-                                                # u = 1.0   → weight 0.50
-                                                # u = 2.0   → weight 0.125 (dynamic crushed)
-                                                # To get ABSOLUTE ZERO weights for dynamic objects, we drop the asymptotic inverse formula
-                                                # and use a direct linear mapping with a hard clamp.
-                                                # u <= 0.6 (Background) -> Weight = 1.0
-                                                # u >= 1.0 (Dynamic)    -> Weight = 0.0
-                                                # Map: u <= 0.7 -> u_scaled <= 0.1 (Background safe)
-                                                #      u >= 1.1 -> u_scaled >= 10.0 (Dynamic crushed)
-                                                m_scale = 45.0
-                                                c_scale = 35.5
-                                                # Denominator MUST be clamped to 0.1, otherwise background (negative values) breaks
-                                                u_final_scaled = torch.clamp(m_scale * u_final - c_scale, min=0.1)
-                                                # Simple inverse-square effectively crushes dynamic weights to 0.01
-                                                w_uncer = torch.clamp(0.5 / (u_final_scaled**2 + 1e-6), min=0.01, max=1.0)
-                                                
-                                                self.uncertainties_inv[src] = w_uncer
+                                                self.geom_uncertainty_labels[src] = u_finals_eval[batch_idx]
+                                                self.uncertainties_inv[src] = w_uncers[batch_idx]
+
+                                    #             # Visualization Hook for Convergence Timeline
+                                    #             target_keyframes = [i for i in range(25,40,1)] # Edit this list to specify which keyframes to visualize
+                                    #             if src in target_keyframes:
+                                    #                 if not hasattr(self, 'uncer_history'):
+                                    #                     self.uncer_history = {}
+                                    #                 if not hasattr(self, 'ba_calls_per_frame'):
+                                    #                     self.ba_calls_per_frame = {}
+                                                    
+                                    #                 if src not in self.ba_calls_per_frame:
+                                    #                     self.ba_calls_per_frame[src] = 0
+                                    #                     self.uncer_history[src] = []
+                                                        
+                                    #                 if self.ba_calls_per_frame[src] < 15:
+                                    #                     tracking_uncer_map = (1.0 - w_uncer).clone().cpu().numpy()
+                                    #                     self.uncer_history[src].append(tracking_uncer_map)
+                                    #                     self.ba_calls_per_frame[src] += 1
+                                                        
+                                    #                     if self.ba_calls_per_frame[src] == 15:
+                                    #                         import matplotlib.pyplot as plt
+                                    #                         import os
+                                                            
+                                    #                         save_dir = os.path.join(self.output, "tracker_convergence_vis")
+                                    #                         os.makedirs(save_dir, exist_ok=True)
+                                                            
+                                    #                         # 1 RGB image + 8 iterations (0,2,4,6,8,10,12,14)
+                                    #                         fig, axs = plt.subplots(1, 9, figsize=(32, 2))
+                                                            
+                                    #                         # Plot RGB Image
+                                    #                         rgb_img = self.images[src].permute(1, 2, 0).cpu().numpy()
+                                    #                         rgb_img = (rgb_img - rgb_img.min()) / (rgb_img.max() - rgb_img.min() + 1e-6)
+                                    #                         axs[0].imshow(rgb_img)
+                                    #                         axs[0].axis("off")
+                                    #                         axs[0].set_title("RGB")
+                                                            
+                                    #                         # Plot Iterations
+                                    #                         for idx, i in enumerate(range(0,15,2)):
+                                    #                             axs[idx+1].imshow(self.uncer_history[src][i], cmap="jet", vmin=0, vmax=1.0)
+                                    #                             axs[idx+1].axis("off")
+                                    #                             axs[idx+1].set_title(f"Iter {i}")
+                                                            
+                                    #                         plt.tight_layout()
+                                    #                         plt.savefig(os.path.join(save_dir, f"frame_{src}_convergence_timeline.png"), bbox_inches="tight")
+                                    #                         plt.close()
 
 
     def get_depth_scale_and_shift(self,index, mono_depth:torch.Tensor, est_depth:torch.Tensor, weights:torch.Tensor):

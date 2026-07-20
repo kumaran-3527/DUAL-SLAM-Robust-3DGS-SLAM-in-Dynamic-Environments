@@ -147,6 +147,10 @@ class Mapper(object):
         Trigger mapping process, get estimated pose and depth from tracking process,
         send continue signal to tracking process when the mapping of the current frame finishes.
         """
+        import time
+        overall_start = time.time()
+        wait_time = 0.0
+        
         # Initialize list to keep track of Keyframes
         # In short, for any idx "i",
         # self.video.timestamp[video_idx[i]] = self.frame_idxs[i]
@@ -167,7 +171,10 @@ class Mapper(object):
                     else:
                         self.printer.print("You have resume the process", FontColor.MAPPER)
 
+            wait_start = time.time()
             frame_info = self.pipe.recv()
+            wait_time += (time.time() - wait_start)
+            
             frame_idx, video_idx = frame_info["timestamp"], frame_info["video_idx"]
             is_init, is_finished = frame_info["just_initialized"], frame_info["end"]
 
@@ -221,6 +228,10 @@ class Mapper(object):
                 viewpoint, kf_id=video_idx, init=False, depthmap=viewpoint.depth
             )
 
+            # Conditionally unblock the tracker here! Allow it to run asynchronously while we optimize the map.
+            if self.config['mapping'].get('async_tracker', True):
+                self.pipe.send("continue")
+
             opt_params = []
             for cam_idx in range(len(self.current_window)):
                 if self.current_window[cam_idx] == 0:
@@ -266,7 +277,10 @@ class Mapper(object):
             if self.config['gui']:
                 self._send_to_gui(video_idx)
 
-            self.pipe.send("continue")
+            if not self.config['mapping'].get('async_tracker', True):
+                self.pipe.send("continue")
+
+        self.active_time = (time.time() - overall_start) - wait_time
 
     """
     Utility functions
@@ -719,27 +733,14 @@ class Mapper(object):
         ssim_map = torch.abs(rendered_img - gt_image).mean(dim=0).cpu().numpy()
         rendered_img = rendered_img.cpu().numpy()
 
-        dino_warp_scores = None
-        if hasattr(self.video, "dino_warp_scores"):
-            dino_warp_scores = self.video.dino_warp_scores[viewpoint.uid].clone()
-            
-        stm_map, ltm_map = self.get_viewpoint_uncertainty_no_grad(viewpoint, dino_warp_scores)
-        stm_map = stm_map.cpu().squeeze(0).numpy()
-        ltm_map = ltm_map.cpu().squeeze(0).numpy()
-        
-        if dino_warp_scores is not None:
-            # resize dino warp scores to image size
-            dino_warp_map = torch.nn.functional.interpolate(
-                dino_warp_scores.unsqueeze(0).unsqueeze(0),
-                size=(viewpoint.image_height, viewpoint.image_width),
-                mode="bilinear"
-            ).squeeze().cpu().numpy()
-        else:
-            dino_warp_map = np.zeros_like(stm_map)
+        u_map, u_track = self.get_viewpoint_uncertainty_no_grad(viewpoint)
+        u_map = u_map.cpu().squeeze(0).numpy()
+        u_track = u_track.cpu().squeeze(0).numpy()
         
         current_window_dict = {}
         current_window_dict[self.current_window[0]] = self.current_window[1:]
-        keyframes = [self.cameras[kf_idx] for kf_idx in self.current_window]
+        # Send ALL valid keyframes to the GUI so that Global BA pose updates are reflected for historical frustums
+        keyframes = [self.cameras[kf_idx] for kf_idx in self.cameras.keys() if self.is_kf.get(kf_idx, False)]
         self.q_main2vis.put(
             gui_utils.GaussianPacket(
                 current_frame=viewpoint,
@@ -748,9 +749,8 @@ class Mapper(object):
                 gtdepth=viewpoint.depth,
                 rendered_img=rendered_img,
                 ssim_map=ssim_map,
-                u_fast=stm_map,
-                u_slow=ltm_map,
-                dino_warp_score=dino_warp_map,
+                u_map=u_map,
+                u_track=u_track,
                 keyframes=keyframes,
                 kf_window=current_window_dict,
             )
@@ -1000,12 +1000,6 @@ class Mapper(object):
                         depth.unsqueeze(0), viewpoint.depth.shape, mode="bicubic"
                     ).squeeze(0)
 
-                # Fetch kinematic gate for this keyframe (bootstrapping fix)
-                _dino_warp_scores = None
-                if hasattr(self.video, "dino_warp_scores"):
-                    _scores = self.video.dino_warp_scores[viewpoint.uid]
-                    if _scores[0, 0].item() != -1.0:
-                        _dino_warp_scores = _scores.clone()
                 _geom_label = None
                 if hasattr(self.video, "geom_uncertainty_labels"):
                     _label = self.video.geom_uncertainty_labels[viewpoint.uid]
@@ -1021,7 +1015,6 @@ class Mapper(object):
                     train_frac,
                     ssim_frac,
                     initialization=True,
-                    dino_warp_scores=_dino_warp_scores,
                     geom_label=_geom_label,
                 )
 
@@ -1166,12 +1159,6 @@ class Mapper(object):
                 ssim_frac = self.uncer_params["train_frac_fix"]
 
 
-                # Fetch kinematic gate for this keyframe (bootstrapping fix)
-                _dino_warp_scores = None
-                if hasattr(self.video, "dino_warp_scores"):
-                    _scores = self.video.dino_warp_scores[viewpoint_kf_idx_stack[cam_idx]]
-                    if _scores[0, 0].item() != -1.0:
-                        _dino_warp_scores = _scores.clone()
                 _geom_label = None
                 if hasattr(self.video, "geom_uncertainty_labels"):
                     _label = self.video.geom_uncertainty_labels[viewpoint_kf_idx_stack[cam_idx]]
@@ -1181,7 +1168,8 @@ class Mapper(object):
                     # optimization window (~25 frames). This shields the Mapper from early, erratic 
                     # geometric masks caused by poor initial poses, ensuring it learns strictly 
                     # from 100% frozen, perfectly converged ground-truth quality labels.
-                    is_mature = viewpoint_kf_idx_stack[cam_idx] < self.video.counter.value - 25
+                    maturity_gating = self.config['mapping']['uncertainty_params'].get('maturity_gating',25)
+                    is_mature = viewpoint_kf_idx_stack[cam_idx] < self.video.counter.value - maturity_gating
                     
                     if _label[0, 0].item() != -1.0 and is_mature:
                         _geom_label = _label.clone()
@@ -1197,7 +1185,6 @@ class Mapper(object):
                     self.uncer_network,
                     train_frac,
                     ssim_frac,
-                    dino_warp_scores=_dino_warp_scores,
                     geom_label=_geom_label,
                 )
                 loss_mapping += current_loss_mapping
@@ -1360,12 +1347,6 @@ class Mapper(object):
                 ssim_frac = self.uncer_params["train_frac_fix"]
 
 
-                # Fetch kinematic gate for this keyframe (bootstrapping fix)
-                _dino_warp_scores = None
-                if hasattr(self.video, "dino_warp_scores"):
-                    _scores = self.video.dino_warp_scores[random_viewpoint_kf_idx_stack[rand_idx]]
-                    if _scores[0, 0].item() != -1.0:
-                        _dino_warp_scores = _scores.clone()
                 _geom_label = None
                 if hasattr(self.video, "geom_uncertainty_labels"):
                     _label = self.video.geom_uncertainty_labels[random_viewpoint_kf_idx_stack[rand_idx]]
@@ -1383,7 +1364,6 @@ class Mapper(object):
                     self.uncer_network,
                     train_frac,
                     ssim_frac,
-                    dino_warp_scores=_dino_warp_scores,
                     geom_label=_geom_label,
                 )
                 loss_mapping += loss_mapping_this_frame
@@ -1506,7 +1486,7 @@ class Mapper(object):
         return ssim_loss
 
     @torch.no_grad()
-    def get_viewpoint_uncertainty_no_grad(self, viewpoint: Camera, dino_warp_scores=None):
+    def get_viewpoint_uncertainty_no_grad(self, viewpoint: Camera):
         """
         Compute the uncertainty for a given viewpoint without gradient computation.
         Returns (stm, ltm) all as resized, adjusted tensors.
@@ -1523,11 +1503,7 @@ class Mapper(object):
             return adjusted ** 2
 
         with Lock():
-            u_fast, _ = self.uncer_network(
-                features,
-                dino_warp_scores=dino_warp_scores,
-                image_grad=viewpoint.grad_mask.to(features.device) if viewpoint.grad_mask is not None else None
-            )
+            u_fast, _ = self.uncer_network(features)
             stm = _process(u_fast)
             # Read the actual BA weights (uncertainties_inv) which range from 0.01 (dynamic) to 1.0 (static)
             w_uncer = self.video.uncertainties_inv[viewpoint.uid].to(self.device)
@@ -1589,24 +1565,9 @@ class Mapper(object):
 
         if self.uncertainty_aware:
             # Add plotting 2x3 grid with additional figures for uncertainty
-            dino_warp_scores = None
-            if hasattr(self.video, "dino_warp_scores"):
-                dino_warp_scores = self.video.dino_warp_scores[viewpoint.uid].clone()
-            
-            stm_map, ltm_map = self.get_viewpoint_uncertainty_no_grad(viewpoint, dino_warp_scores)
-            stm_map = stm_map.cpu().squeeze(0)
-            ltm_map = ltm_map.cpu().squeeze(0)
-
-            if dino_warp_scores is not None:
-                dino_warp_map = torch.nn.functional.interpolate(
-                    dino_warp_scores.unsqueeze(0).unsqueeze(0),
-                    size=(viewpoint.image_height, viewpoint.image_width),
-                    mode="bilinear"
-                ).squeeze().cpu()
-            else:
-                dino_warp_map = torch.zeros_like(stm_map)
-                
-            uncertainty_map = dino_warp_map
+            u_map, u_track = self.get_viewpoint_uncertainty_no_grad(viewpoint)
+            u_map = u_map.cpu().squeeze(0)
+            u_track = u_track.cpu().squeeze(0)
 
             # SSIM loss
             opacity = render_pkg["opacity"].detach().squeeze()
@@ -1616,9 +1577,8 @@ class Mapper(object):
             ssim_loss = ssim_loss.cpu().squeeze(0)
         else:
             # All white
-            uncertainty_map = torch.ones_like(rendered_img[0])
-            stm_map = torch.ones_like(rendered_img[0])
-            ltm_map = torch.ones_like(rendered_img[0])
+            u_map = torch.ones_like(rendered_img[0])
+            u_track = torch.ones_like(rendered_img[0])
             ssim_loss = torch.ones_like(rendered_img[0])
 
         # Make the plot
@@ -1628,7 +1588,7 @@ class Mapper(object):
         fig_width = 12
         fig_width = fig_width * aspect_ratio
 
-        # Plot 2x3 grid: Ground Truth RGB, Rendered RGB, SSIM Loss, u_aligned_max, u_fast, u_slow
+        # Plot 2x3 grid: Ground Truth RGB, Rendered RGB, SSIM Loss, u_aligned_max, u_map, u_track
         fig, axs = plt.subplots(2, 3, figsize=(fig_width, fig_height))
         axs[0, 0].imshow(gt_image.cpu().permute(1, 2, 0))
         axs[0, 0].set_title("Ground Truth RGB", fontsize=16)
@@ -1639,13 +1599,14 @@ class Mapper(object):
         axs[0, 2].imshow(ssim_loss, cmap='jet', vmin=0, vmax=5)
         axs[0, 2].set_title("SSIM Loss", fontsize=16)
 
-        axs[1, 0].imshow(uncertainty_map, cmap='jet', vmin=0, vmax=1.0)
-        axs[1, 0].set_title("DINO Warping Score (SCE)", fontsize=16)
+        # Plot the rendered depth
+        axs[1, 0].imshow(rendered_depth.cpu().squeeze(), cmap='jet', vmin=0, vmax=depth_max)
+        axs[1, 0].set_title("Rendered Depth", fontsize=16)
         
-        axs[1, 1].imshow(stm_map, cmap='jet', vmin=0, vmax=5)
+        axs[1, 1].imshow(u_map, cmap='jet', vmin=0, vmax=5)
         axs[1, 1].set_title("Mapping Uncertainty", fontsize=16)
         
-        axs[1, 2].imshow(ltm_map, cmap='jet', vmin=0, vmax=5)
+        axs[1, 2].imshow(u_track, cmap='jet', vmin=0, vmax=1.0)
         axs[1, 2].set_title("Tracking Uncertainty", fontsize=16)
         
         for i in range(2):
@@ -1694,7 +1655,7 @@ class Mapper(object):
         """Used to inspect the uncertainty"""
         assert (
             n_rows % 3 == 0
-        )  # one row for imgs, one for u_fast, one for u_slow
+        )  # one row for imgs, one for u_map, one for u_track
 
         n_img = int(n_rows * n_cols / 3)
         if n_img >= len(self.cameras):
@@ -1728,9 +1689,9 @@ class Mapper(object):
                     viewpoint = self.cameras[keyframe_idxs[idx]]
                     rgb = viewpoint.original_image.cpu().permute(1, 2, 0).numpy()
                     rgb = (rgb * 255.0).astype(np.uint8)
-                    uncer_fast, uncer_slow = self.get_viewpoint_uncertainty_no_grad(viewpoint)
-                    uncer_fast = uncer_fast.cpu().squeeze(0)
-                    uncer_slow = uncer_slow.cpu().squeeze(0)
+                    uncer_map, uncer_track = self.get_viewpoint_uncertainty_no_grad(viewpoint)
+                    uncer_map = uncer_map.cpu().squeeze(0)
+                    uncer_track = uncer_track.cpu().squeeze(0)
 
                     axs[3 * i, j].imshow(rgb)
                     if keyframe_idxs[idx] in self.current_window:
@@ -1746,11 +1707,11 @@ class Mapper(object):
                         )
                         axs[3 * i, j].add_patch(rect)
                     axs[3 * i + 1, j].imshow(
-                        uncer_fast, cmap="jet", vmin=0, vmax=5
+                        uncer_map, cmap="jet", vmin=0, vmax=5
                     )
                     axs[3 * i + 1, j].grid(False)
                     axs[3 * i + 2, j].imshow(
-                        uncer_slow, cmap="jet", vmin=0, vmax=5
+                        uncer_track, cmap="jet", vmin=0, vmax=1.0
                     )
                     axs[3 * i + 2, j].grid(False)
                 axs[3 * i, j].axis("off")

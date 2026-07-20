@@ -93,9 +93,8 @@ class GaussianPacket:
         gtdepth=None,
         rendered_img=None,
         ssim_map=None,
-        u_fast=None,
-        u_slow=None,
-        dino_warp_score=None,
+        u_map=None,
+        u_track=None,
         keyframes=None,
         finish=False,
         kf_window=None,
@@ -125,9 +124,8 @@ class GaussianPacket:
         self.gtdepth = self.resize_img(gtdepth, 320)
         self.rendered_img = self.resize_img(rendered_img, 320)
         self.ssim_map = self.resize_img(ssim_map, 320)
-        self.u_fast = self.resize_img(u_fast, 320)
-        self.u_slow = self.resize_img(u_slow, 320)
-        self.dino_warp_score = self.resize_img(dino_warp_score, 320)
+        self.u_map = self.resize_img(u_map, 320)
+        self.u_track = self.resize_img(u_track, 320)
         self.keyframes = keyframes
         self.finish = finish
         self.kf_window = kf_window

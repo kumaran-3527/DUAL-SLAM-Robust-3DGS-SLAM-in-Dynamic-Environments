@@ -154,7 +154,6 @@ def get_loss_mapping_uncertainty(
     ssim_frac: float,
     initialization: bool = False,
     freeze_uncertainty_loss: bool = False,
-    dino_warp_scores: Tensor = None,  # [H/8, W/8] SCE from DINOv2 feature warping, in [0,1]
     geom_label: Tensor = None,  # [H/8, W/8] geometric pseudo-label from tracker (experience replay)
 ) -> Tuple[Tensor, Tensor]:
     """Compute mapping loss with uncertainty estimation for SLAM system.
@@ -201,14 +200,9 @@ def get_loss_mapping_uncertainty(
     # Compute SSIM loss if enabled
     ssim_loss = 1.0 - ssim(rendered_img, gt_img) if config["Training"]["ssim_loss"] else 0.0
 
-    # Note: dino_warp_scores and image_gradient are passed separately to
-    # uncertainty_network for computing the Mixture-of-Experts UKD loss.
+    # Note: uncertainty_network takes DINOv2 features and outputs the mapping uncertainty.
     features = viewpoint.features.to(device=rendered_img.device)
-    u_fast, _ = uncertainty_network(
-        features, 
-        dino_warp_scores=dino_warp_scores, 
-        image_grad=viewpoint.grad_mask.to(features.device) if viewpoint.grad_mask is not None else None
-    )
+    u_fast, _ = uncertainty_network(features)
 
     # Compute scaled tracking weight (W) to use as the Adaptive Bayesian Prior penalty
     tracker_weight = None
@@ -231,7 +225,6 @@ def get_loss_mapping_uncertainty(
         ssim_fraction=ssim_frac,
         uncertainty_config=config["uncertainty_params"],
         mask=rgb_pixel_mask,
-        dino_warp_scores=dino_warp_scores,
         tracker_weight=tracker_weight,
     )
 

@@ -1,0 +1,42 @@
+,freiburg2_desk_with_person,freiburg3_sitting_halfsphere,freiburg3_sitting_rpy,freiburg3_sitting_static,freiburg3_sitting_xyz,freiburg3_walking_halfsphere,freiburg3_walking_rpy,freiburg3_walking_static,freiburg3_walking_xyz,Average
+wildgs-slam,1.30,1.77,2.26,0.50,0.88,1.45,3.15,0.44,1.22,1.44
+droidw, 1.2, 1.4, 2.11, 0.47, 0.80, 1.58, 3.10, 0.5, 1.21, 1.37
+1ours, 1.12 , 1.62 , 2.07, 0.47 , 0.80 , 1.48 , 3.12, 0.43, 1.21, 1.36
+2ours, 1.23,1.67,2.08,0.47,0.80,1.45,3.08,0.45,1.23,1.38
+
+
+,bonn_balloon,bonn_balloon2,bonn_crowd,bonn_crowd2,bonn_moving_nonobstructing_box,bonn_moving_nonobstructing_box2,bonn_person_tracking,bonn_person_tracking2,Average
+wildgs-slam,2.73,2.38,1.62,2.20,1.69,2.51,3.55,3.10,2.47
+droidw, 2.7, 2.5, 1.30, 1.8, 1.58, 2.32, 3.5, 3.0, 2.32
+1ours,2.45, 2.32, 1.39, 1.69, 1.53, 2.33, 3.36, 3.0, 2.25
+2ours,2.50,2.29,1.37,1.72,1.54,2.36,3.63,3.09,2.31
+2ours,2.53,2.30,1.48,1.76,1.46,2.48,3.63,3.17,2.35
+3ours,2.53,2.29,1.52,1.89,1.49,2.56,3.32,3.24,2.35
+4ours,2.54,2.29,1.62,1.83,1.49,2.56,3.46,3.16,2.37
+4ours,2.57,2.27,1.53,1.71,1.50,2.55,3.40,3.18,2.34
+
+
+
+
+,ANYmal1,ANYmal2,basketball,crowd,person_tracking,racket,stones,table_tracking1,table_tracking2,umbrella,Average
+wildgs-slam,0.21,0.25,0.16,0.28,0.76,0.39,0.37,0.63,1.26,0.24,0.46
+droidw, 0.33, 0.26, 0.18, 0.29, 0.73, 0.46, 0.36, 0.89, 2.74, 0.23, 0.65
+1ours, 0.21, 0.21, 0.13, 0.25, 0.75, 0.39, 0.33, 0.68, 2.00, 0.24, 0.51
+2ours,0.22,0.20,0.14,0.25,0.78,0.42,0.33,0.63,1.60,0.25,0.48
+2ours,0.21,0.24,0.15,0.25,0.76,0.41,0.46,0.74,1.88,0.29,0.54
+
+
+1.
+lr = 4e-7 
+wd = 0.1
+m = 45.0
+c = 35.5
+distill_loss = 0.01
+adaptive_log = 2.0
+non kf: interp
+symb : recent_frame - chosen >= 25 frames #line:1184
+
+2. 
+same params;all proceeses killed
+
+4. same params, with cuda kernels 

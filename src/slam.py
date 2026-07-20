@@ -106,8 +106,17 @@ class SLAM:
             pass
         self.printer.print("Tracking Starts!", FontColor.TRACKER)
         self.printer.pbar_ready()
+        
+        start_time = time.time()
         self.tracker.run(self.stream)
-        self.printer.print("Tracking Done!", FontColor.TRACKER)
+        end_time = time.time()
+        
+        tracking_time = getattr(self.tracker, 'active_time', end_time - start_time)
+        tracking_fps = len(self.stream) / tracking_time if tracking_time > 0 else 0
+        self.printer.print(f"Tracking Done! (Time: {tracking_time:.2f}s, FPS: {tracking_fps:.2f})", FontColor.TRACKER)
+        
+        with open(f"{self.save_dir}/fps_stats.txt", "a") as f:
+            f.write(f"Tracking Thread - Frames: {len(self.stream)}, Time: {tracking_time:.4f}s, FPS: {tracking_fps:.4f}\n")
 
     def mapping(self, pipe, q_main2vis, q_vis2main):
         if self.cfg["mapping"]["uncertainty_params"]["activate"]:
@@ -122,8 +131,17 @@ class SLAM:
         while self.all_trigered < self.num_running_thread:
             pass
         self.printer.print("Mapping Starts!", FontColor.MAPPER)
+        
+        start_time = time.time()
         self.mapper.run()
-        self.printer.print("Mapping Done!", FontColor.MAPPER)
+        end_time = time.time()
+        
+        mapping_time = getattr(self.mapper, 'active_time', end_time - start_time)
+        mapping_fps = len(self.stream) / mapping_time if mapping_time > 0 else 0
+        self.printer.print(f"Mapping Done! (Time: {mapping_time:.2f}s, FPS: {mapping_fps:.2f})", FontColor.MAPPER)
+        
+        with open(f"{self.save_dir}/fps_stats.txt", "a") as f:
+            f.write(f"Mapping Thread - Frames: {len(self.stream)}, Time: {mapping_time:.4f}s, FPS: {mapping_fps:.4f}\n")
 
         self.terminate()
 
@@ -385,6 +403,8 @@ class SLAM:
         self.num_running_thread += len(processes)
         if self.cfg['gui']:
             self.num_running_thread += 1
+            
+        start_time = time.time()
         for p in processes:
             p.start()
 
@@ -410,6 +430,14 @@ class SLAM:
 
         for p in processes:
             p.join()
+
+        end_time = time.time()
+        pipeline_time = end_time - start_time
+        pipeline_fps = len(self.stream) / pipeline_time if pipeline_time > 0 else 0
+        self.printer.print(f"Whole Pipeline Done! (Total Time: {pipeline_time:.2f}s, Overall FPS: {pipeline_fps:.2f})", FontColor.INFO)
+        
+        with open(f"{self.save_dir}/fps_stats.txt", "a") as f:
+            f.write(f"Whole Pipeline - Frames: {len(self.stream)}, Time: {pipeline_time:.4f}s, FPS: {pipeline_fps:.4f}\n")
 
         self.printer.terminate()
 

@@ -3,3 +3,14 @@ scene: downtown4
 
 data:
   input_folder: ROOT_FOLDER_PLACEHOLDER/downtown4
+
+tracking:
+  buffer: 400
+mapping:
+  pcd_downsample: 32
+  online_plotting: false
+  Training:
+    alpha: 0.9
+  uncertainty_params:
+    uncer_depth_mult: 0.00
+  final_refine_iters: 0

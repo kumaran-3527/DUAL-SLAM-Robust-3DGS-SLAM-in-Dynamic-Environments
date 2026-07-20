@@ -38,6 +38,10 @@ class Tracker:
         4. send the estimated pose and depth to mapper, 
             and wait until the mapper finish its current mapping optimization.
         '''
+        import time
+        overall_start = time.time()
+        wait_time = 0.0
+        
         prev_kf_idx = 0
         curr_kf_idx = 0
         prev_ba_idx = 0
@@ -66,7 +70,11 @@ class Tracker:
                     self.pipe.send({"is_keyframe":True, "video_idx":curr_kf_idx,
                                     "timestamp":timestamp, "just_initialized": True, 
                                     "end":False})
+                    
+                    wait_start = time.time()
                     self.pipe.recv()
+                    wait_time += (time.time() - wait_start)
+                    
                     self.frontend.initialize_second_stage()
                 else:
                     if self.enable_online_ba and curr_kf_idx >= prev_ba_idx + self.ba_freq:
@@ -78,7 +86,10 @@ class Tracker:
                     self.pipe.send({"is_keyframe":True, "video_idx":curr_kf_idx,
                                     "timestamp":timestamp, "just_initialized": False, 
                                     "end":False})
+                                    
+                    wait_start = time.time()
                     self.pipe.recv()
+                    wait_time += (time.time() - wait_start)
 
             prev_kf_idx = curr_kf_idx
             self.printer.update_pbar()
@@ -86,6 +97,8 @@ class Tracker:
         self.pipe.send({"is_keyframe":True, "video_idx":None,
                         "timestamp":None, "just_initialized": False, 
                         "end":True})
+                        
+        self.active_time = (time.time() - overall_start) - wait_time
 
 
                 

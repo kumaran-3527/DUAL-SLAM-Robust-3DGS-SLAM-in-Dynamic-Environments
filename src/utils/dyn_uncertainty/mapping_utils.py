@@ -216,7 +216,7 @@ def compute_mapping_loss_components(
     ssim_fraction: float,
     uncertainty_config: dict,
     mask: Optional[torch.Tensor] = None,
-    dino_warp_scores: Optional[torch.Tensor] = None,
+
     tracker_weight: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -243,12 +243,7 @@ def compute_mapping_loss_components(
         ssim_fraction: SSIM loss weight fraction
         uncertainty_config: Dictionary containing uncertainty estimation parameters
         mask: Optional visibility mask for loss computation [1,H,W]
-        dino_warp_scores: Optional per-patch Semantic Consistency Error (SCE) in [0,1]
-            at DINOv2 patch resolution [H',W']. Derived from cosine distance of DINOv2
-            features warped across BA edges in `depth_video.ba()`. Acts as the kinematic
-            gate M: high SCE (M≈1) means multi-view feature inconsistency — physical motion.
-            Used to modulate the Fast MLP NLL effective residual as a convex interpolation
-            between the photometric SSIM residual (M=0) and a kinematic reference level (M=1).
+
     """
     # Initialize median pooling for SSIM
     median_filter = MedianPool2d(
@@ -319,15 +314,7 @@ def compute_mapping_loss_components(
     # do not penalize far away pixels
     small_depth_loss[small_depth > depth_threshold] = 0.0
 
-    # if dino_warp_scores is not None:
-    #     kinematic_gate = resample_tensor_to_shape(
-    #         dino_warp_scores.detach().to(filtered_ssim_loss.device),
-    #         filtered_ssim_loss.shape,
-    #     )
-    #     # lambda_kin = 0.5
-    #     # kinematic_floor = -lambda_kin * torch.log(1.0 - kinematic_gate + 1e-3)
-    #     # filtered_ssim_loss = filtered_ssim_loss + kinematic_floor * filtered_ssim_loss.detach().mean()
-    #     filtered_ssim_loss = filtered_ssim_loss * torch.sqrt((1 + kinematic_gate)/2.0)
+
 
     # Adaptive Bayesian Prior: Modulate log(sigma) penalty using scaled tracker weights
     if tracker_weight is not None:
@@ -338,8 +325,8 @@ def compute_mapping_loss_components(
         )
         # formulation 4: lambda(W) = 1.0 + gamma * W
         # gamma = 4.0 gives a 5x penalty ceiling on static backgrounds (W=1.0)
-        gamma = 2.0
-        log_sigma_weight = 1.0 + gamma * w_resampled
+        gamma = uncertainty_config['gamma']
+        log_sigma_weight = 0.98 + gamma * w_resampled
     else:
         log_sigma_weight = 1.0
 
