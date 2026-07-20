@@ -351,14 +351,12 @@ class DepthVideo:
 
         # We need jj features. jj is a tensor of indices.
         # feats_jj shape: [E, 384, H_feat, W_feat]
-        feats_jj = self.dino_feats[jj.cpu()].permute(0, 3, 1, 2).to(self.device)
+        feats_jj = self.dino_feats[jj.cpu()].permute(0, 3, 1, 2).contiguous().to(self.device)
         feats_jj.div_(feats_jj.norm(p=2, dim=1, keepdim=True).clamp_min(1e-12))
-        feats_jj = feats_jj.contiguous()
         
         # We need ii features. ii is idx repeated E times.
-        feats_ii = self.dino_feats[ii.cpu()].permute(0, 3, 1, 2).to(self.device)
+        feats_ii = self.dino_feats[ii.cpu()].permute(0, 3, 1, 2).contiguous().to(self.device)
         feats_ii.div_(feats_ii.norm(p=2, dim=1, keepdim=True).clamp_min(1e-12))
-        feats_ii = feats_ii.contiguous()
 
         # x1 is [1, E, H_full, W_full, 3] -> [E, H_full, W_full, 3]
         x1_b = x1[0].contiguous()
@@ -544,8 +542,8 @@ class DepthVideo:
                             jj_cpu = jj_filtered.cpu()
                             ii_cpu = ii_filtered.cpu()
 
-                            feats_jj = self.dino_feats_resize[jj_cpu].to(self.device)
-                            feats_ii = self.dino_feats_resize[ii_cpu].to(self.device)
+                            feats_jj = self.dino_feats_resize[jj_cpu].contiguous().to(self.device)
+                            feats_ii = self.dino_feats_resize[ii_cpu].contiguous().to(self.device)
 
                             # In-place L2-normalization to prevent VRAMA spikes
                             # PyTorch's F.normalize allocates a full-sized duplicate tensor.
