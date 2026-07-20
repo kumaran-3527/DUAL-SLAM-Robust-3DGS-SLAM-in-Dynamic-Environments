@@ -245,6 +245,13 @@ class SLAM:
 
         self.printer.print("Metrics Evaluation Done!", FontColor.EVAL)
 
+        # Cleanup: Delete the heavy mono_priors disk cache to free up memory
+        import shutil
+        mono_priors_dir = os.path.join(self.save_dir, "mono_priors")
+        if os.path.exists(mono_priors_dir):
+            shutil.rmtree(mono_priors_dir)
+            self.printer.print("Cleaned up mono_priors disk cache.", FontColor.INFO)
+
     def save_colmap_format_kf_dynrm(self, traj_est, dino_feats=None, keyframe_only=True):
         import shutil
         import cv2

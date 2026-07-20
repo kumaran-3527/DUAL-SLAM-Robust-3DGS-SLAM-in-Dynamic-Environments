@@ -352,11 +352,13 @@ class DepthVideo:
         # We need jj features. jj is a tensor of indices.
         # feats_jj shape: [E, 384, H_feat, W_feat]
         feats_jj = self.dino_feats[jj.cpu()].permute(0, 3, 1, 2).to(self.device)
-        feats_jj = F.normalize(feats_jj, p=2, dim=1).contiguous()
+        feats_jj.div_(feats_jj.norm(p=2, dim=1, keepdim=True).clamp_min(1e-12))
+        feats_jj = feats_jj.contiguous()
         
         # We need ii features. ii is idx repeated E times.
         feats_ii = self.dino_feats[ii.cpu()].permute(0, 3, 1, 2).to(self.device)
-        feats_ii = F.normalize(feats_ii, p=2, dim=1).contiguous()
+        feats_ii.div_(feats_ii.norm(p=2, dim=1, keepdim=True).clamp_min(1e-12))
+        feats_ii = feats_ii.contiguous()
 
         # x1 is [1, E, H_full, W_full, 3] -> [E, H_full, W_full, 3]
         x1_b = x1[0].contiguous()
@@ -545,9 +547,10 @@ class DepthVideo:
                             feats_jj = self.dino_feats_resize[jj_cpu].to(self.device)
                             feats_ii = self.dino_feats_resize[ii_cpu].to(self.device)
 
-                            # L2-normalize along the channel dim for true cosine similarity
-                            feats_jj = F.normalize(feats_jj, p=2, dim=1)
-                            feats_ii = F.normalize(feats_ii, p=2, dim=1)
+                            # In-place L2-normalization to prevent VRAMA spikes
+                            # PyTorch's F.normalize allocates a full-sized duplicate tensor.
+                            feats_jj.div_(feats_jj.norm(p=2, dim=1, keepdim=True).clamp_min(1e-12))
+                            feats_ii.div_(feats_ii.norm(p=2, dim=1, keepdim=True).clamp_min(1e-12))
 
                             # --- NEW CUDA IMPLEMENTATION ---
                             # The fused kernel handles bilinear interpolation, dot product, clamping, 
@@ -589,7 +592,7 @@ class DepthVideo:
                                 # Train the tracker dynamically during Stage 1, Stage 2, and normal tracking
                                 if hasattr(self, 'tracker_net') and len(ii_filtered) > 0:
                                     
-                                    if self.cfg['tracking']['uncertainty_params'].get('freeze_base', False):
+                                    if self.cfg['tracking']['uncertainty_params'].get('freeze_base', True):
                                         import copy
                                         self.tracker_net.base_net = copy.deepcopy(self.uncer_network.net_fast)
                                         self.tracker_net.base_net.requires_grad_(False)
