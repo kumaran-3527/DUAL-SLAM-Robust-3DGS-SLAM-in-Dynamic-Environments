@@ -143,6 +143,14 @@ class SLAM:
         with open(f"{self.save_dir}/fps_stats.txt", "a") as f:
             f.write(f"Mapping Thread - Frames: {len(self.stream)}, Time: {mapping_time:.4f}s, FPS: {mapping_fps:.4f}\n")
 
+        # Calculate Whole Pipeline FPS BEFORE the offline terminate/evaluation functions
+        pipeline_time = end_time - start_time
+        pipeline_fps = len(self.stream) / pipeline_time if pipeline_time > 0 else 0
+        self.printer.print(f"Whole Pipeline Done! (Total Time: {pipeline_time:.2f}s, Overall FPS: {pipeline_fps:.2f})", FontColor.INFO)
+        
+        with open(f"{self.save_dir}/fps_stats.txt", "a") as f:
+            f.write(f"Whole Pipeline - Frames: {len(self.stream)}, Time: {pipeline_time:.4f}s, FPS: {pipeline_fps:.4f}\n")
+
         self.terminate()
 
     def backend(self):
@@ -439,12 +447,8 @@ class SLAM:
             p.join()
 
         end_time = time.time()
-        pipeline_time = end_time - start_time
-        pipeline_fps = len(self.stream) / pipeline_time if pipeline_time > 0 else 0
-        self.printer.print(f"Whole Pipeline Done! (Total Time: {pipeline_time:.2f}s, Overall FPS: {pipeline_fps:.2f})", FontColor.INFO)
-        
-        with open(f"{self.save_dir}/fps_stats.txt", "a") as f:
-            f.write(f"Whole Pipeline - Frames: {len(self.stream)}, Time: {pipeline_time:.4f}s, FPS: {pipeline_fps:.4f}\n")
+        pipeline_time_with_eval = end_time - start_time
+        self.printer.print(f"System Shutdown. (Total Time including offline eval: {pipeline_time_with_eval:.2f}s)", FontColor.INFO)
 
         self.printer.terminate()
 

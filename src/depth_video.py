@@ -590,7 +590,7 @@ class DepthVideo:
                                 # Train the tracker dynamically during Stage 1, Stage 2, and normal tracking
                                 if hasattr(self, 'tracker_net') and len(ii_filtered) > 0:
                                     
-                                    if self.cfg['tracking']['uncertainty_params'].get('freeze_base', True):
+                                    if self.cfg['tracking']['uncertainty_params'].get('freeze_base', False):
                                         import copy
                                         self.tracker_net.base_net = copy.deepcopy(self.uncer_network.net_fast)
                                         self.tracker_net.base_net.requires_grad_(False)
