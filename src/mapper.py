@@ -129,10 +129,11 @@ class Mapper(object):
             # Fast MLP: base LR — reacts per-frame to kinematic signals.
             # Slow MLP: 0.6x LR — consolidates conservatively into LTM.
             base_lr = self.uncer_params["lr"]
+            base_wd = self.uncer_params.get("weight_decay", 1e-5)
             self.uncer_optimizer = torch.optim.Adam([
                                                     {'params': list(self.uncer_network.net_fast.parameters()), 
                                                     'lr': base_lr, 
-                                                    'weight_decay': 1e-5}
+                                                    'weight_decay': base_wd}
                                                     ])
 
             self.vis_uncertainty_online = self.uncer_params["vis_uncertainty_online"]
@@ -1171,7 +1172,7 @@ class Mapper(object):
                     maturity_gating = self.config['mapping']['uncertainty_params'].get('maturity_gating',25)
                     is_mature = viewpoint_kf_idx_stack[cam_idx] < self.video.counter.value - maturity_gating
                     
-                    if _label[0, 0].item() != -1.0 and is_mature:
+                    if _label[0, 0].item() != -1.0 and is_mature and self.video.is_initialized_fully:
                         _geom_label = _label.clone()
                 (
                     current_uncertainty,
