@@ -1289,12 +1289,12 @@ class Mapper(object):
     def final_refine(self, iters=26000):
         self.printer.print("Starting final refinement", FontColor.MAPPER)
         
-        # Boost mapping MLP learning rate and drop weight decay for offline global optimization
+        # Boost mapping MLP learning rate for offline global optimization
         if self.uncertainty_aware and self.uncer_optimizer is not None:
             self.printer.print("Applying aggressive offline hyperparams to Mapper MLP", FontColor.MAPPER)
             for param_group in self.uncer_optimizer.param_groups:
                 param_group['lr'] = 0.001
-                param_group['weight_decay'] = 1e-5
+                # Keep the high weight decay to force the map to learn fine static details!
 
         # Do final update of depths and poses
         self._update_keyframes_from_frontend()

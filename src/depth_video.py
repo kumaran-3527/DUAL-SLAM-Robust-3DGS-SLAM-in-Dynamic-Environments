@@ -101,7 +101,7 @@ class DepthVideo:
 
             from src.utils.dyn_uncertainty.uncertainty_model import LoRATrackerNet
             lora_rank = cfg['tracking']['uncertainty_params'].get('lora_rank', 8) #4
-            lora_lr = cfg['tracking']['uncertainty_params'].get('lora_lr',4e-7) # 4e-7, 
+            lora_lr = cfg['tracking']['uncertainty_params'].get('lora_lr', 4e-7) # 4e-7, 
             lora_wd = cfg['tracking']['uncertainty_params'].get('lora_wd', 0.1)
             
             self.tracker_net = LoRATrackerNet(base_net=self.uncer_network.net_fast, rank=lora_rank).to(self.device)
@@ -537,6 +537,28 @@ class DepthVideo:
                             grid = x1.clone()  # [E_f, H_s, W_s, 2]
                             grid[..., 0] = 2.0 * grid[..., 0] / (W_s - 1) - 1.0
                             grid[..., 1] = 2.0 * grid[..., 1] / (H_s - 1) - 1.0
+                            
+                            # -- NEW OCCLUSION CHECK --
+                            use_occlusion = self.cfg['tracking']['uncertainty_params'].get('use_occlusion_check', False)
+                            if use_occlusion:
+                                # Sample the actual disparity of the target frame (jj) at the projected coordinates
+                                disp_jj = self.disps[jj_filtered].unsqueeze(1)  # [E_f, 1, H_s, W_s]
+                                sampled_disp_jj = torch.nn.functional.grid_sample(
+                                    disp_jj, grid, mode='bilinear', padding_mode='zeros', align_corners=True
+                                ).squeeze(1)  # [E_f, H_s, W_s]
+                                
+                                # Convert actual target inverse depth to metric depth
+                                actual_Z_target = 1.0 / (sampled_disp_jj + 1e-6)
+                                
+                                occlusion_thresh = self.cfg['tracking']['uncertainty_params'].get('occlusion_thresh', 1.15)
+                                # If the projected depth (Z_target) is much larger than the actual depth surface,
+                                # the point is occluded by something closer in the target frame.
+                                not_occluded = Z_target <= (actual_Z_target * occlusion_thresh)
+                                
+                                # Invalidating occluded pixels safely sets SCE = 0.0, avoiding false positives.
+                                geom_valid = geom_valid & not_occluded
+                            # -------------------------
+
                             
                             # ── Condition 3: Cosine Similarity with Clamping & Threshold ──
                             jj_cpu = jj_filtered.cpu()
