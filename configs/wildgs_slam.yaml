@@ -81,8 +81,8 @@ mapping:
     gamma: 2.0
     maturity_gating: 25
 
-    lr: 0.0001
-    weight_decay: 1.0e-4
+    lr: 0.0002
+    weight_decay: 0.0001
 
 
 tracking:
@@ -127,9 +127,10 @@ tracking:
     activate: True
     use_occlusion_check: False    # NEW: Toggle the occlusion check on/off
     occlusion_thresh: 1.20       # NEW: 15% depth tolerance
-    lora_lr: 4.0e-7   # Using 1.0e-4 so PyYAML parses as float, not string
-    lora_wd: 0.01          
+    lora_lr: 4.0e-6   # Using 1.0e-4 so PyYAML parses as float, not string
+    lora_wd: 0.05          
     lora_rank: 8
+    freeze_base: True
   force_keyframe_every_n_frames: 9 # set to negative value if you don't want to force to insert keyframes
   nb_ref_frame_metric_depth_filtering: 6 # number of reference frames for filtering high uncertainty metric depth points
 
