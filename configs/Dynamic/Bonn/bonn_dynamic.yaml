@@ -17,3 +17,6 @@ cam:  #intrinsic is different per scene in TUM, this cam does not have distortio
   H_out: 384
   W_out: 512
 
+
+mapping:
+  masked_render_eval: True

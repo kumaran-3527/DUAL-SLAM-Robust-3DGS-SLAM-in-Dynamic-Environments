@@ -324,9 +324,8 @@ def compute_mapping_loss_components(
             "bilinear"
         )
         # formulation 4: lambda(W) = 1.0 + gamma * W
-        # gamma = 4.0 gives a 5x penalty ceiling on static backgrounds (W=1.0)
         gamma = uncertainty_config['gamma']
-        log_sigma_weight = 0.98 + gamma * w_resampled
+        log_sigma_weight = 0.97 + gamma * w_resampled
     else:
         log_sigma_weight = 1.0
 

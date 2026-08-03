@@ -284,7 +284,14 @@ def get_loss_mapping_uncertainty(
         u_fast_norm = (u_fast - u_fast.mean()) / (u_fast.std() + 1e-6)
         geom_label_norm = (geom_label_resized - geom_label_resized.mean()) / (geom_label_resized.std() + 1e-6)
         
-        distill_loss = F.l1_loss(u_fast_norm, geom_label_norm.detach())
+        tracker_weight_resized = F.interpolate(
+            tracker_weight.unsqueeze(0).unsqueeze(0),
+            size=u_fast.shape,
+            mode='bilinear',
+            align_corners=False,
+        ).squeeze(0).squeeze(0)
+        
+        distill_loss = (tracker_weight_resized.detach() * (u_fast_norm - geom_label_norm.detach()).abs()).mean()
         # print("distill_loss", distill_loss.item(), "total_loss", total_loss.item())
 
         total_loss = total_loss + distill_mult * distill_loss

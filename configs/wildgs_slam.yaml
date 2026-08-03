@@ -8,6 +8,7 @@ device: "cuda:0"
 
 mapping:
   async_tracker: False
+  masked_render_eval: False
   online_plotting: False # render and save images online
   full_resolution: False # if using the full resolution for mapping, but we always keep downsampled size for tracking
   final_refine_iters: 20000 # iterations of final refinement, it will be forced to be 3000 if fast_mode is on
@@ -76,12 +77,12 @@ mapping:
     reg_mult: 0.5
     ssim_mult: 0.5
     uncer_depth_mult: 0.2
-    distill_mult: 0.01
+    distill_mult: 0.1
     gamma: 2.0
     maturity_gating: 25
 
     lr: 0.0001
-    weight_decay: 0.005
+    weight_decay: 1.0e-4
 
 
 tracking:
@@ -126,14 +127,12 @@ tracking:
     activate: True
     use_occlusion_check: False    # NEW: Toggle the occlusion check on/off
     occlusion_thresh: 1.20       # NEW: 15% depth tolerance
-    lora_lr: 0.00000004       # Using 1.0e-4 so PyYAML parses as float, not string
-    lora_wd: 0.1                
+    lora_lr: 4.0e-7   # Using 1.0e-4 so PyYAML parses as float, not string
+    lora_wd: 0.01          
     lora_rank: 8
   force_keyframe_every_n_frames: 9 # set to negative value if you don't want to force to insert keyframes
   nb_ref_frame_metric_depth_filtering: 6 # number of reference frames for filtering high uncertainty metric depth points
-    # lora_lr: 1e-4
-    # lora_wd: 0.01
-    # lora_rank: 4
+
 
 cam:
   ### target/output camera settings, camera_size -> resize -> crop -> target_size

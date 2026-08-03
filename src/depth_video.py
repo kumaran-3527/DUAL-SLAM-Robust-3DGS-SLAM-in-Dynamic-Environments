@@ -7,7 +7,7 @@ import src.geom.ba
 from torch.multiprocessing import Value
 from torch.multiprocessing import Lock
 import torch.nn.functional as F
-
+    
 from src.modules.droid_net import cvx_upsample
 import src.geom.projective_ops as pops
 from src.utils.common import align_scale_and_shift
@@ -83,16 +83,11 @@ class DepthVideo:
             self.uncertainties_inv = torch.ones(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
             self.mapping_uncertainties_inv = torch.ones(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
             
-            
 
-            # Experience Replay: geometric pseudo-labels from tracker (sentinel: -1.0 = not yet computed)
+            
             self.geom_uncertainty_labels = -1.0 * torch.ones(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
-            # SCE scheduling: run on new-keyframe events and every SCE_STRIDE BA calls.
             self._sce_ba_call_count = 0
             self._sce_new_frame_pending = False
-            # self.SCE_STRIDE = 2           # recompute every N BA calls (tune: 2-8)
-            # self.SCE_MIN_GAP = 0     # skip stereo pairs and adjacent frames
-            # self.SCE_MAX_GAP = 4   # since this counts keyframes not frames larger values can lead to huge viewpoint changes
             
             self.use_sce_init_gate = cfg['tracking']["uncertainty_params"].get('use_sce_init_gate', False)
             self.cached_sce_f = None
@@ -100,8 +95,8 @@ class DepthVideo:
             self.cached_jj_filtered = None
 
             from src.utils.dyn_uncertainty.uncertainty_model import LoRATrackerNet
-            lora_rank = cfg['tracking']['uncertainty_params'].get('lora_rank', 8) #4
-            lora_lr = cfg['tracking']['uncertainty_params'].get('lora_lr', 4e-7) # 4e-7, 
+            lora_rank = cfg['tracking']['uncertainty_params'].get('lora_rank', 8)
+            lora_lr = cfg['tracking']['uncertainty_params'].get('lora_lr', 4e-7)
             lora_wd = cfg['tracking']['uncertainty_params'].get('lora_wd', 0.1)
             
             self.tracker_net = LoRATrackerNet(base_net=self.uncer_network.net_fast, rank=lora_rank).to(self.device)
@@ -347,7 +342,6 @@ class DepthVideo:
         # projected point is valid only if its inside the image range and the depth is greater than 0
         valid_mask = (x1_rounded[..., 1] >= 0) & (x1_rounded[..., 1] < x1.shape[2]) & \
                     (x1_rounded[..., 0] >= 0) & (x1_rounded[..., 0] < x1.shape[3]) & (x1[...,2]>0)
-        import mfc_backends
 
         # We need jj features. jj is a tensor of indices.
         # feats_jj shape: [E, 384, H_feat, W_feat]
@@ -557,51 +551,20 @@ class DepthVideo:
                                 
                                 # Invalidating occluded pixels safely sets SCE = 0.0, avoiding false positives.
                                 geom_valid = geom_valid & not_occluded
-                            # -------------------------
 
-                            
-                            # ── Condition 3: Cosine Similarity with Clamping & Threshold ──
+
                             jj_cpu = jj_filtered.cpu()
                             ii_cpu = ii_filtered.cpu()
 
                             feats_jj = self.dino_feats_resize[jj_cpu].contiguous().to(self.device)
                             feats_ii = self.dino_feats_resize[ii_cpu].contiguous().to(self.device)
 
-                            # In-place L2-normalization to prevent VRAMA spikes
-                            # PyTorch's F.normalize allocates a full-sized duplicate tensor.
                             feats_jj.div_(feats_jj.norm(p=2, dim=1, keepdim=True).clamp_min(1e-12))
                             feats_ii.div_(feats_ii.norm(p=2, dim=1, keepdim=True).clamp_min(1e-12))
 
-                            # --- NEW CUDA IMPLEMENTATION ---
-                            # The fused kernel handles bilinear interpolation, dot product, clamping, 
-                            # thresholding, and geometric validity masking without intermediate VRAM allocations!
-                            # Now executed in a single pass for maximum speed (chunking removed)!
                             sce_f = mfc_backends.sce_feature_warp(
                                 feats_ii, feats_jj, grid, geom_valid
                             )
-
-                            # --- OLD PYTORCH IMPLEMENTATION ---
-                            # # Bilinear interpolation of target features at projected coords
-                            # warped = F.grid_sample(
-                            #     feats_jj, grid,
-                            #     mode='bilinear', padding_mode='zeros', align_corners=True
-                            # )
-                            #
-                            # # Cosine similarity = dot product (already L2-normalized)
-                            # cos_sim = (feats_ii * warped).sum(dim=1)  # [E_f, H_s, W_s]
-                            #
-                            # # Clamp to [0, 1] to reject outlier negative similarities
-                            # cos_sim = torch.clamp(cos_sim, min=0.0, max=1.0)
-                            #
-                            # # Hard threshold: zero out low-confidence matches (<= 0.5)
-                            # cos_sim = torch.where(
-                            #     cos_sim >= 0.50, cos_sim, torch.zeros_like(cos_sim)
-                            # )
-                            #
-                            # # SCE = 1 - cosine_similarity (high SCE = semantically inconsistent)
-                            # sce_f = 1.0 - cos_sim
-                            # # Zero out pixels that failed geometric validity
-                            # sce_f[~geom_valid] = 0.0
 
                             if self.use_sce_init_gate and not self.is_initialized_fully:
                                 self.cached_sce_f = sce_f.detach().clone()
@@ -612,7 +575,7 @@ class DepthVideo:
                                 # Train the tracker dynamically after Stage 1
                                 if hasattr(self, 'tracker_net') and len(ii_filtered) > 0 and self.is_initialized:
                                     
-                                    if self.cfg['tracking']['uncertainty_params'].get('freeze_base', False):
+                                    if self.cfg['tracking']['uncertainty_params'].get('freeze_base', True):
                                         import copy
                                         self.tracker_net.base_net = copy.deepcopy(self.uncer_network.net_fast)
                                         self.tracker_net.base_net.requires_grad_(False)
@@ -665,49 +628,51 @@ class DepthVideo:
                                                 self.geom_uncertainty_labels[src] = u_finals_eval[batch_idx]
                                                 self.uncertainties_inv[src] = w_uncers[batch_idx]
 
-                                                # Visualization Hook for Convergence Timeline
-                                                target_keyframes = [i for i in range(25,40,1)] # Edit this list to specify which keyframes to visualize
-                                                if src in target_keyframes:
-                                                    if not hasattr(self, 'uncer_history'):
-                                                        self.uncer_history = {}
-                                                    if not hasattr(self, 'ba_calls_per_frame'):
-                                                        self.ba_calls_per_frame = {}
+
+
+                                                # # Visualization Hook for Convergence Timeline
+                                                # target_keyframes = [i for i in range(0,12,1)] # Edit this list to specify which keyframes to visualize
+                                                # if src in target_keyframes:
+                                                #     if not hasattr(self, 'uncer_history'):
+                                                #         self.uncer_history = {}
+                                                #     if not hasattr(self, 'ba_calls_per_frame'):
+                                                #         self.ba_calls_per_frame = {}
                                                     
-                                                    if src not in self.ba_calls_per_frame:
-                                                        self.ba_calls_per_frame[src] = 0
-                                                        self.uncer_history[src] = []
+                                                #     if src not in self.ba_calls_per_frame:
+                                                #         self.ba_calls_per_frame[src] = 0
+                                                #         self.uncer_history[src] = []
                                                         
-                                                    if self.ba_calls_per_frame[src] < 15:
-                                                        tracking_uncer_map = (1.0 - w_uncers[batch_idx]).clone().cpu().numpy()
-                                                        self.uncer_history[src].append(tracking_uncer_map)
-                                                        self.ba_calls_per_frame[src] += 1
+                                                #     if self.ba_calls_per_frame[src] < 15:
+                                                #         tracking_uncer_map = (1.0 - w_uncers[batch_idx]).clone().cpu().numpy()
+                                                #         self.uncer_history[src].append(tracking_uncer_map)
+                                                #         self.ba_calls_per_frame[src] += 1
                                                         
-                                                        if self.ba_calls_per_frame[src] == 15:
-                                                            import matplotlib.pyplot as plt
-                                                            import os
+                                                #         if self.ba_calls_per_frame[src] == 15:
+                                                #             import matplotlib.pyplot as plt
+                                                #             import os
                                                             
-                                                            save_dir = os.path.join(self.output, "tracker_convergence_vis")
-                                                            os.makedirs(save_dir, exist_ok=True)
+                                                #             save_dir = os.path.join(self.output, "tracker_convergence_vis")
+                                                #             os.makedirs(save_dir, exist_ok=True)
                                                             
-                                                            # 1 RGB image + 8 iterations (0,2,4,6,8,10,12,14)
-                                                            fig, axs = plt.subplots(1, 9, figsize=(32, 2))
+                                                #             # 1 RGB image + 8 iterations (0,2,4,6,8,10,12,14)
+                                                #             fig, axs = plt.subplots(1, 9, figsize=(32, 2))
                                                             
-                                                            # Plot RGB Image
-                                                            rgb_img = self.images[src].permute(1, 2, 0).cpu().numpy()
-                                                            rgb_img = (rgb_img - rgb_img.min()) / (rgb_img.max() - rgb_img.min() + 1e-6)
-                                                            axs[0].imshow(rgb_img)
-                                                            axs[0].axis("off")
-                                                            axs[0].set_title("RGB")
+                                                #             # Plot RGB Image
+                                                #             rgb_img = self.images[src].permute(1, 2, 0).cpu().numpy()
+                                                #             rgb_img = (rgb_img - rgb_img.min()) / (rgb_img.max() - rgb_img.min() + 1e-6)
+                                                #             axs[0].imshow(rgb_img)
+                                                #             axs[0].axis("off")
+                                                #             axs[0].set_title("RGB")
                                                             
-                                                            # Plot Iterations
-                                                            for idx, i in enumerate(range(0,15,2)):
-                                                                axs[idx+1].imshow(self.uncer_history[src][i], cmap="jet", vmin=0, vmax=1.0)
-                                                                axs[idx+1].axis("off")
-                                                                axs[idx+1].set_title(f"Iter {i}")
+                                                #             # Plot Iterations
+                                                #             for idx, i in enumerate(range(0,15,2)):
+                                                #                 axs[idx+1].imshow(self.uncer_history[src][i], cmap="jet", vmin=0, vmax=1.0)
+                                                #                 axs[idx+1].axis("off")
+                                                #                 axs[idx+1].set_title(f"Iter {i}")
                                                             
-                                                            plt.tight_layout()
-                                                            plt.savefig(os.path.join(save_dir, f"frame_{src}_convergence_timeline.png"), bbox_inches="tight")
-                                                            plt.close()
+                                                #             plt.tight_layout()
+                                                #             plt.savefig(os.path.join(save_dir, f"frame_{src}_convergence_timeline.png"), bbox_inches="tight")
+                                                #             plt.close()
 
 
     def get_depth_scale_and_shift(self,index, mono_depth:torch.Tensor, est_depth:torch.Tensor, weights:torch.Tensor):

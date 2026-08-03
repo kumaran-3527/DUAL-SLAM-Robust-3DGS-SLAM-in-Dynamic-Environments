@@ -1169,8 +1169,9 @@ class Mapper(object):
                     # optimization window (~25 frames). This shields the Mapper from early, erratic 
                     # geometric masks caused by poor initial poses, ensuring it learns strictly 
                     # from 100% frozen, perfectly converged ground-truth quality labels.
-                    maturity_gating = self.config['mapping']['uncertainty_params'].get('maturity_gating',25)
-                    is_mature = viewpoint_kf_idx_stack[cam_idx] < self.video.counter.value - maturity_gating
+                    kf_idx_cur = viewpoint_kf_idx_stack[cam_idx]
+                    maturity_gating = self.config['mapping']['uncertainty_params'].get('maturity_gating', 25)
+                    is_mature = kf_idx_cur < self.video.counter.value - maturity_gating
                     
                     if _label[0, 0].item() != -1.0 and is_mature and self.video.is_initialized_fully:
                         _geom_label = _label.clone()
@@ -1293,8 +1294,9 @@ class Mapper(object):
         if self.uncertainty_aware and self.uncer_optimizer is not None:
             self.printer.print("Applying aggressive offline hyperparams to Mapper MLP", FontColor.MAPPER)
             for param_group in self.uncer_optimizer.param_groups:
-                param_group['lr'] = 0.001
-                # Keep the high weight decay to force the map to learn fine static details!
+                param_group['lr'] = 0.0004
+                param_group['weight_decay'] = 1e-5
+                # Keep the weight decay zero to force the map to learn fine static details!
 
         # Do final update of depths and poses
         self._update_keyframes_from_frontend()
@@ -1657,6 +1659,88 @@ class Mapper(object):
             self.save_fig_everything(kf_idx, plot_dir)
         # Create gif (duration=300ms -> 3.3 fps)
         create_gif_from_directory(plot_dir, plot_dir + '/output.gif', duration=300, online=True)
+
+    @torch.no_grad()
+    def eval_mapping_metrics(self):
+        import json
+        import csv
+        from thirdparty.gaussian_splatting.utils.image_utils import psnr
+        from thirdparty.gaussian_splatting.utils.loss_utils import ssim_masked
+        
+        self.printer.print("Evaluating Mapping Metrics...", FontColor.INFO)
+        
+        import lpips as lpips_lib
+        cal_lpips = lpips_lib.LPIPS(net="alex", spatial=True).to(self.device)
+        psnr_array, ssim_array, lpips_array = [], [], []
+        
+        dataset_root = self.config["data"]["input_folder"]
+        mask_folder = os.path.join(dataset_root, "mask_final")
+        
+        for kf_idx in self.video_idxs:
+            viewpoint = self.cameras[kf_idx]
+            render_pkg = render(
+                viewpoint, self.gaussians, self.pipeline_params, self.background
+            )
+            rendered_img = torch.clamp(render_pkg["render"].detach(), 0.0, 1.0)
+            gt_image = viewpoint.original_image
+            
+            # Load dynamic mask (1 for dynamic object, 0 for background)
+            # We want to evaluate metrics on the background (unmasked) pixels
+            color_path = self.frame_reader.color_paths[viewpoint.uid]
+            filename = os.path.basename(color_path)
+            mask_path = os.path.join(mask_folder, filename)
+            
+            mask = None
+            if os.path.exists(mask_path):
+                # Load mask, assume 255/1 is dynamic object
+                loaded_mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+                if loaded_mask is not None:
+                    # Invert mask: True for background (pixels to keep), False for dynamic object
+                    mask = (loaded_mask == 0)
+                    mask = torch.from_numpy(mask).to(self.device)
+                    # Resize mask if config expects lower resolution
+                    if not self.config["mapping"]["full_resolution"]:
+                        mask = mask.unsqueeze(0).unsqueeze(0).float()
+                        mask = F.interpolate(mask, size=(gt_image.shape[1], gt_image.shape[2]), mode="nearest").squeeze() > 0.5
+            
+            if mask is None:
+                # If no mask, assume all pixels are valid (static background)
+                mask = torch.ones((gt_image.shape[1], gt_image.shape[2]), dtype=torch.bool, device=self.device)
+                
+            if mask.sum() == 0:
+                # The whole image is masked out, skip metric calculation
+                continue
+            
+            # PSNR: purely pixel-wise, use only background pixels
+            psnr_score = psnr(rendered_img[:, mask].unsqueeze(0), gt_image[:, mask].unsqueeze(0)).item()
+            
+            # SSIM: sliding-window metric, must compute on full image then average over background
+            ssim_score = ssim_masked(rendered_img.unsqueeze(0), gt_image.unsqueeze(0), mask)
+            
+            # LPIPS: use spatial=True to get per-pixel map [1, 1, H, W], then mask at averaging
+            # Input must be in [-1, 1] for lpips library
+            lpips_map = cal_lpips(rendered_img.unsqueeze(0) * 2 - 1, gt_image.unsqueeze(0) * 2 - 1)  # [1, 1, H, W]
+            # Safety: LPIPS spatial map may differ slightly in resolution from the input
+            if lpips_map.shape[2:] != (mask.shape[0], mask.shape[1]):
+                lpips_map = F.interpolate(lpips_map, size=(mask.shape[0], mask.shape[1]), mode='bilinear', align_corners=False)
+            lpips_score = lpips_map.squeeze()[mask].mean().item()
+            
+            psnr_array.append(psnr_score)
+            ssim_array.append(ssim_score)
+            lpips_array.append(lpips_score)
+            
+        mean_psnr = float(np.mean(psnr_array)) if psnr_array else 0.0
+        mean_ssim = float(np.mean(ssim_array)) if ssim_array else 0.0
+        mean_lpips = float(np.mean(lpips_array)) if lpips_array else 0.0
+        
+        self.printer.print(f'Mapping - Mean PSNR: {mean_psnr:.4f}, SSIM: {mean_ssim:.4f}, LPIPS: {mean_lpips:.4f}', FontColor.INFO)
+        
+        # Save to csv
+        metrics_csv = os.path.join(self.save_dir, "mapping_metrics.csv")
+        with open(metrics_csv, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["PSNR", "SSIM", "LPIPS"])
+            writer.writerow([mean_psnr, mean_ssim, mean_lpips])
 
     @torch.no_grad()
     def _vis_uncertainty_mask_all(self, n_rows=9, n_cols=8, is_final=False):

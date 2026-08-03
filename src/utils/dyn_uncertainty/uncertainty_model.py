@@ -59,7 +59,6 @@ class MLPNetwork(nn.Module):
         for layer in self.layers:
             x = layer(x)
             x = self.net_activation(x)
-            x = F.dropout(x, p=0.2)
 
         # Pass through output layer and apply softplus activation
         x = self.output_layer(x)

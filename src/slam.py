@@ -223,6 +223,9 @@ class SLAM:
             self.save_dir,
             iteration="after_refine",
         )
+        
+        if self.cfg['mapping']['masked_render_eval'] :
+            self.mapper.eval_mapping_metrics()
 
         ## Not used, see head comments of the function
         # self._eval_depth_all(ate_statistics, global_scale, r_a, t_a)
