@@ -69,6 +69,27 @@ def ssim(img1, img2, window_size=11, size_average=True):
     return _ssim(img1, img2, window, window_size, channel, size_average)
 
 
+def ssim_masked(img1, img2, mask, window_size=11):
+    """Compute SSIM and average only over unmasked (background) pixels.
+    
+    Args:
+        img1, img2: [1, 3, H, W] tensors in [0, 1].
+        mask: [H, W] boolean tensor. True = valid background pixel.
+    Returns:
+        Scalar SSIM score over background pixels.
+    """
+    channel = img1.size(-3)
+    window = create_window(window_size, channel)
+    if img1.is_cuda:
+        window = window.cuda(img1.get_device())
+    window = window.type_as(img1)
+
+    ssim_map = _ssim(img1, img2, window, window_size, channel, size_average=False)  # [1, H, W]
+    # Average ssim_map.mean(0) gives [H, W]; then mask and mean
+    ssim_per_pix = ssim_map.mean(0)  # [H, W]
+    return ssim_per_pix[mask].mean().item()
+
+
 def _ssim(img1, img2, window, window_size, channel, size_average=True):
     mu1 = F.conv2d(img1, window, padding=window_size // 2, groups=channel)
     mu2 = F.conv2d(img2, window, padding=window_size // 2, groups=channel)
@@ -98,4 +119,4 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
     if size_average:
         return ssim_map.mean()
     else:
-        return ssim_map.mean(1).mean(1).mean(1)
+        return ssim_map.squeeze(0)  # [C, H, W] - allows per-pixel access
