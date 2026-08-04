@@ -96,10 +96,11 @@ class DepthVideo:
 
             from src.utils.dyn_uncertainty.uncertainty_model import LoRATrackerNet
             lora_rank = cfg['tracking']['uncertainty_params'].get('lora_rank', 8)
+            lora_alpha = cfg['tracking']['uncertainty_params'].get('lora_alpha', 8.0)
             lora_lr = cfg['tracking']['uncertainty_params'].get('lora_lr', 4e-7)
             lora_wd = cfg['tracking']['uncertainty_params'].get('lora_wd', 0.1)
             
-            self.tracker_net = LoRATrackerNet(base_net=self.uncer_network.net_fast, rank=lora_rank).to(self.device)
+            self.tracker_net = LoRATrackerNet(base_net=self.uncer_network.net_fast, rank=lora_rank, alpha=lora_alpha).to(self.device)
             # Only optimize the LoRA parameters (A and B matrices)
             lora_params = [p for n, p in self.tracker_net.named_parameters() if 'lora_' in n]
             self.tracker_optimizer = torch.optim.AdamW(

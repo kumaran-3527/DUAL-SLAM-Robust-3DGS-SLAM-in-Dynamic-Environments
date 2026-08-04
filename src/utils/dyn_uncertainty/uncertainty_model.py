@@ -102,10 +102,11 @@ class LoRATrackerNet(nn.Module):
     It wraps the mapper's base MLPNetwork and injects low-rank perturbations 
     during tracking to rapidly fit geometric motion without destroying the base prior.
     """
-    def __init__(self, base_net: nn.Module, rank: int = 4):
+    def __init__(self, base_net: nn.Module, rank: int = 4, alpha: float = 8.0):
         super().__init__()
         self.base_net = base_net
         self.rank = rank
+        self.scaling = alpha / rank
         
         self.lora_A = nn.ParameterList()
         self.lora_B = nn.ParameterList()
@@ -138,13 +139,13 @@ class LoRATrackerNet(nn.Module):
         for i, layer in enumerate(self.base_net.layers):
             base_out = layer(x)
             lora_out = F.linear(F.linear(x, self.lora_A[i]), self.lora_B[i])
-            x = base_out + lora_out
+            x = base_out + lora_out * self.scaling
             x = self.base_net.net_activation(x)
             # dropout is disabled during tracking due to eval() or just implicitly
         
         base_out = self.base_net.output_layer(x)
         lora_out = F.linear(F.linear(x, self.lora_out_A), self.lora_out_B)
-        x = base_out + lora_out
+        x = base_out + lora_out * self.scaling
         x = self.softplus(x)
 
         return x.view(B, H, W) if has_batch else x.view(H, W)

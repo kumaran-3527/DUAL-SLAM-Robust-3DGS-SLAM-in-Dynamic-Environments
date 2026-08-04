@@ -1290,12 +1290,12 @@ class Mapper(object):
     def final_refine(self, iters=26000):
         self.printer.print("Starting final refinement", FontColor.MAPPER)
         
-        # # Boost mapping MLP learning rate for offline global optimization
-        # if self.uncertainty_aware and self.uncer_optimizer is not None:
-        #     self.printer.print("Applying aggressive offline hyperparams to Mapper MLP", FontColor.MAPPER)
-        #     for param_group in self.uncer_optimizer.param_groups:
-        #         param_group['lr'] = 0.0001
-        #         param_group['weight_decay'] = 1e-5
+        # Boost mapping MLP learning rate for offline global optimization
+        if self.uncertainty_aware and self.uncer_optimizer is not None:
+            self.printer.print("Remove tracker conditioning", FontColor.MAPPER)
+            for param_group in self.uncer_optimizer.param_groups:
+                param_group['gamma'] = 0.0
+                param_group['distill_loss'] = 0.00
 
         # Do final update of depths and poses
         self._update_keyframes_from_frontend()
@@ -1687,7 +1687,9 @@ class Mapper(object):
             # We want to evaluate metrics on the background (unmasked) pixels
             color_path = self.frame_reader.color_paths[viewpoint.uid]
             filename = os.path.basename(color_path)
-            mask_path = os.path.join(mask_folder, filename)
+            # The new masks are always saved as .png to avoid compression artifacts
+            mask_filename = os.path.splitext(filename)[0] + ".png"
+            mask_path = os.path.join(mask_folder, mask_filename)
             
             mask = None
             if os.path.exists(mask_path):
