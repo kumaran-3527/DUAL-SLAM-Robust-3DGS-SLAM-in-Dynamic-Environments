@@ -78,7 +78,7 @@ mapping:
     ssim_mult: 0.5
     uncer_depth_mult: 0.2
     distill_mult: 0.00
-    gamma: 0.0
+    gamma: 2.0
     residual_gate_alpha: 0.6
     maturity_gating: 25
 
