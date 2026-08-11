@@ -323,9 +323,16 @@ def compute_mapping_loss_components(
             processed_uncertainty.shape,
             "bilinear"
         )
-        # formulation 4: lambda(W) = 1.0 + gamma * W
-        gamma = uncertainty_config['gamma']
-        log_sigma_weight = 0.97 + gamma * w_resampled
+        gamma = uncertainty_config.get('gamma', 1.0)
+        
+        # Residual-Gated Prior
+        uncer_depth_mult = uncertainty_config.get("uncer_depth_mult", 0.2)
+        combined_residual = filtered_ssim_loss + uncer_depth_mult * small_depth_loss
+        alpha = uncertainty_config.get('residual_gate_alpha', 0.05)
+        residual_gate = torch.exp(-alpha * combined_residual)
+        
+        # formulation: lambda(W) = 0.97 + gamma * W * Gate
+        log_sigma_weight = 0.98 + gamma * w_resampled * residual_gate
     else:
         log_sigma_weight = 1.0
 

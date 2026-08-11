@@ -1,5 +1,6 @@
 inherit_from: ./configs/Dynamic/YouTube/youtube.yaml
 scene: tomyum
+max_frames: -1
 
 stride: 2
 

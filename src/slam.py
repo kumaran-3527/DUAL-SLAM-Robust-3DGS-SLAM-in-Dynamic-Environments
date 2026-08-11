@@ -211,7 +211,10 @@ class SLAM:
                     self.printer,
                 )
             except Exception as e:
-                self.printer.print(e, FontColor.ERROR)
+                self.printer.print(str(e), FontColor.ERROR)
+
+        if self.cfg['mapping']['masked_render_eval'] :
+            self.mapper.eval_mapping_metrics(suffix="before_refine")
 
         if self.cfg["tracking"]["backend"]["final_ba"]:
             self.mapper.final_refine(
@@ -225,7 +228,7 @@ class SLAM:
         )
         
         if self.cfg['mapping']['masked_render_eval'] :
-            self.mapper.eval_mapping_metrics()
+            self.mapper.eval_mapping_metrics(suffix="after_refine")
 
         ## Not used, see head comments of the function
         # self._eval_depth_all(ate_statistics, global_scale, r_a, t_a)

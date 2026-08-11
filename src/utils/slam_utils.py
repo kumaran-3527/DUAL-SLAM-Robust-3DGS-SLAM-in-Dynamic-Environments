@@ -281,8 +281,8 @@ def get_loss_mapping_uncertainty(
         # (which pixels are dynamic vs static) without fighting over absolute scale.
         # Z-Score L1 magnitude is ~0.8 (expected |N(0,1) - N(0,1)|), so at
         # distill_mult=0.01 this contributes ~0.008 — about 2-5% of total_loss.
-        u_fast_norm = (u_fast - u_fast.mean()) / (u_fast.std() + 1e-6)
-        geom_label_norm = (geom_label_resized - geom_label_resized.mean()) / (geom_label_resized.std() + 1e-6)
+        u_fast_norm = (u_fast - u_fast.mean()) / u_fast.std().clamp(min=0.1)
+        geom_label_norm = (geom_label_resized - geom_label_resized.mean()) / geom_label_resized.std().clamp(min=0.1)
         
         tracker_weight_resized = F.interpolate(
             tracker_weight.unsqueeze(0).unsqueeze(0),

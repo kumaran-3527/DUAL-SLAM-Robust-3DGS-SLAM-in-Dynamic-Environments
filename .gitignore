@@ -23,3 +23,9 @@ docs/
 SymbiGS_SLAM__Jointly_Regularized_Dual_Uncertainty_Framework_for_robust_3DGS_SLAM_in_the_Wild/
 paper_tex_source/
 literature/
+paper_tex_files/
+scripts_run/*
+mask_generation/*
+make_video.py
+output_video.mp4
+scout-slam/*

@@ -1,5 +1,6 @@
 inherit_from: ./configs/Dynamic/YouTube/youtube.yaml
 scene: tomyum2
+max_frames: 1000       # use the first X images from the dataset, -1 means using all
 
 stride: 2
 

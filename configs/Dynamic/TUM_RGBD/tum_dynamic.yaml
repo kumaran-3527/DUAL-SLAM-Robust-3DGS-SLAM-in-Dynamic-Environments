@@ -7,6 +7,7 @@ tracking:
 
 # Less weight on the depth loss for TUM
 mapping:
+  masked_render_eval: True
   Training:
     alpha: 0.8
 

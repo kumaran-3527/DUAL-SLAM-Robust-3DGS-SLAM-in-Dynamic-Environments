@@ -321,7 +321,7 @@ class DepthVideo:
             if jj.shape[0] >= nb_frame:
                 break
             if j not in jj:
-                torch.cat((jj, j.unsqueeze(0).to(jj.device)))
+                jj = torch.cat((jj, j.unsqueeze(0).to(jj.device)))
 
         ii = torch.tensor(idx).repeat(jj.shape[0])
 
@@ -387,11 +387,14 @@ class DepthVideo:
             # We compare depth_j against i_disp at (valid_x, valid_y)
             depth_i = i_disp[valid_y, valid_x]
             
-            error = torch.abs(1.0 / depth_j - 1.0 / depth_i) * depth_j
+            error = torch.abs(1.0 / depth_j - depth_i) * depth_j
             correct_mask = error < 0.02
             
-            accurate_count[valid_y[correct_mask], valid_x[correct_mask]] += 1
-            inaccurate_count[valid_y[~correct_mask], valid_x[~correct_mask]] += 1
+            ones = torch.ones_like(valid_y[correct_mask], dtype=accurate_count.dtype)
+            accurate_count.index_put_((valid_y[correct_mask], valid_x[correct_mask]), ones, accumulate=True)
+            
+            ones_inacc = torch.ones_like(valid_y[~correct_mask], dtype=inaccurate_count.dtype)
+            inaccurate_count.index_put_((valid_y[~correct_mask], valid_x[~correct_mask]), ones_inacc, accumulate=True)
 
         # Clean the gpu memory
         torch.cuda.empty_cache()
@@ -403,8 +406,16 @@ class DepthVideo:
            motion_only=False, global_ba=False):
 
         if self.uncertainty_aware:
-            if not getattr(self, 'is_initialized', False) or motion_only or not self._tracker_net_trained:
+            is_init = getattr(self, 'is_initialized', False)
+            if not is_init or not self._tracker_net_trained:
                 u_inv_i = self.mapping_uncertainties_inv[ii][None, :, :, :, None]
+                weight *= u_inv_i
+            elif motion_only:
+                use_mapper_only = self.cfg['tracking']["uncertainty_params"].get('use_mapper_only_for_filler', False)
+                if not use_mapper_only:
+                    u_inv_i = self.uncertainties_inv[ii][None, :, :, :, None]
+                else:
+                    u_inv_i = self.mapping_uncertainties_inv[ii][None, :, :, :, None]
                 weight *= u_inv_i
             else:
                 u_inv_i = self.uncertainties_inv[ii][None, :, :, :, None] 
@@ -458,7 +469,7 @@ class DepthVideo:
             # ── Semantic Consistency Error (SCE) via DINOv2 Warping ──
             if self.uncertainty_aware:
 
-                _run_sce = not global_ba
+                _run_sce = not global_ba and not motion_only
                 if _run_sce:
                     self._sce_ba_call_count = 0
                     self._sce_new_frame_pending = False
@@ -620,7 +631,7 @@ class DepthVideo:
                                             u_finals_eval = self.tracker_net(feats_bhwc)
                                             
                                             m_scale = 45.0
-                                            c_scale = 35.5
+                                            c_scale = 35.0
                                             u_finals_scaled = torch.clamp(m_scale * u_finals_eval - c_scale, min=0.1)
                                             w_uncers = torch.clamp(0.5 / (u_finals_scaled**2 + 1e-6), min=0.01, max=1.0)
                                             
@@ -632,7 +643,7 @@ class DepthVideo:
 
 
                                                 # # Visualization Hook for Convergence Timeline
-                                                # target_keyframes = [i for i in range(0,12,1)] # Edit this list to specify which keyframes to visualize
+                                                # target_keyframes = [i for i in range(30,40,1)] # Edit this list to specify which keyframes to visualize
                                                 # if src in target_keyframes:
                                                 #     if not hasattr(self, 'uncer_history'):
                                                 #         self.uncer_history = {}

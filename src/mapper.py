@@ -1291,11 +1291,11 @@ class Mapper(object):
         self.printer.print("Starting final refinement", FontColor.MAPPER)
         
         # Boost mapping MLP learning rate for offline global optimization
-        if self.uncertainty_aware and self.uncer_optimizer is not None:
-            self.printer.print("Remove tracker conditioning", FontColor.MAPPER)
-            for param_group in self.uncer_optimizer.param_groups:
-                param_group['gamma'] = 0.0
-                param_group['distill_loss'] = 0.00
+        # if self.uncertainty_aware and self.uncer_optimizer is not None:
+        #     self.printer.print("Remove tracker conditioning", FontColor.MAPPER)
+            # for param_group in self.uncer_optimizer.param_groups:
+            #     param_group['gamma'] = 2.0
+            #     param_group['distill_loss'] = 0.01
 
         # Do final update of depths and poses
         self._update_keyframes_from_frontend()
@@ -1660,13 +1660,14 @@ class Mapper(object):
         create_gif_from_directory(plot_dir, plot_dir + '/output.gif', duration=300, online=True)
 
     @torch.no_grad()
-    def eval_mapping_metrics(self):
+    def eval_mapping_metrics(self, suffix=""):
         import json
         import csv
         from thirdparty.gaussian_splatting.utils.image_utils import psnr
         from thirdparty.gaussian_splatting.utils.loss_utils import ssim_masked
         
-        self.printer.print("Evaluating Mapping Metrics...", FontColor.INFO)
+        step_name = f" ({suffix})" if suffix else ""
+        self.printer.print(f"Evaluating Mapping Metrics{step_name}...", FontColor.INFO)
         
         import lpips as lpips_lib
         cal_lpips = lpips_lib.LPIPS(net="alex", spatial=True).to(self.device)
@@ -1734,10 +1735,11 @@ class Mapper(object):
         mean_ssim = float(np.mean(ssim_array)) if ssim_array else 0.0
         mean_lpips = float(np.mean(lpips_array)) if lpips_array else 0.0
         
-        self.printer.print(f'Mapping - Mean PSNR: {mean_psnr:.4f}, SSIM: {mean_ssim:.4f}, LPIPS: {mean_lpips:.4f}', FontColor.INFO)
+        self.printer.print(f'Mapping{step_name} - Mean PSNR: {mean_psnr:.4f}, SSIM: {mean_ssim:.4f}, LPIPS: {mean_lpips:.4f}', FontColor.INFO)
         
         # Save to csv
-        metrics_csv = os.path.join(self.save_dir, "mapping_metrics.csv")
+        csv_name = f"mapping_metrics_{suffix}.csv" if suffix else "mapping_metrics.csv"
+        metrics_csv = os.path.join(self.save_dir, csv_name)
         with open(metrics_csv, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["PSNR", "SSIM", "LPIPS"])

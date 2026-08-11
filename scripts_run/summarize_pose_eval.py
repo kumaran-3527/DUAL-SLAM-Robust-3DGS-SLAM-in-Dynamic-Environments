@@ -26,20 +26,27 @@ for dataset in datasets:
 
             rmse = float(output[8].split(',')[0].replace("{'rmse': ",''))
             
-            # Add metrics to the row
-            row_data.append(f"{rmse*1e2:.2f}")
+            # Add metrics to the row: multiply by 100, truncate to 2 decimal places (no rounding)
+            val_str = f"{rmse * 100:.6f}"
+            truncated = val_str[:val_str.index('.') + 3]
+            row_data.append(truncated)
             rmses.append(rmse)
         else:
             row_data.append("N/A")  # If file doesn't exist, mark it as N/A
-    avg_rmse = np.nanmean(rmses)
-    averages.append(f"{avg_rmse*1e2:.2f}")
+            
+    avg_rmse = np.nanmean(rmses) if rmses else np.nan
+    if not np.isnan(avg_rmse):
+        avg_str = f"{avg_rmse * 100:.6f}"
+        averages.append(avg_str[:avg_str.index('.') + 3])
+    else:
+        averages.append("N/A")
     for scene, value in zip(scenes, row_data):
         data[scene].append(value)
 
     data['Average'] = averages
 
     # Convert the data to a Pandas DataFrame
-    df = pd.DataFrame(data, index=['wildgs-slam'])
+    df = pd.DataFrame(data, index=['ours'])
 
     # Save the DataFrame as a CSV file
     csv_path = f"./output/{dataset}_eval.csv"

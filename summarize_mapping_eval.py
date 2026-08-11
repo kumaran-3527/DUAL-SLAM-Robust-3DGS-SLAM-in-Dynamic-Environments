@@ -3,13 +3,13 @@ import csv
 import glob
 
 def main():
-    base_dir = "output/Bonn"
+    base_dir = "output/TUM_RGBD"
     if not os.path.exists(base_dir):
         print(f"Directory {base_dir} does not exist.")
         return
 
     # Find all mapping_metrics.csv files in subdirectories of output/Bonn
-    csv_files = glob.glob(os.path.join(base_dir, "*", "mapping_metrics.csv"))
+    csv_files = glob.glob(os.path.join(base_dir, "*", "mapping_metrics_after_refine.csv"))
     
     if not csv_files:
         print("No mapping_metrics.csv files found.")
@@ -47,7 +47,7 @@ def main():
     avg_lpips = sum(r["LPIPS"] for r in results) / len(results)
 
     # Write to consolidated CSV
-    output_csv = "output/Bonn_mapping_eval_consolidated.csv"
+    output_csv = "output/TUM_RGBD_mapping_eval_consolidated.csv"
     with open(output_csv, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(["Sequence", "PSNR", "SSIM", "LPIPS"])
