@@ -22,7 +22,10 @@ cam:
 
 tracking:
   buffer: 560
-
+  uncertainty_params:
+    use_mapper_only_for_filler: False
+    use_interpolation_for_filler: True
+    
 # mapping:
 #   Training:
 #     gaussian_extent: 0.5 # Prune points that stretch too far into the background
