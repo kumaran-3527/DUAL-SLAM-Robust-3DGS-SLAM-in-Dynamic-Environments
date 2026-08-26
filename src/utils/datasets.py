@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 from thirdparty.gaussian_splatting.utils.graphics_utils import focal2fov
+from scipy.spatial.transform import Rotation
 
 def readEXR_onlydepth(filename):
     """
@@ -495,79 +496,149 @@ class YouTube(BaseDataset):
         self.n_img = len(self.color_paths)
 
 
+# class DROIDW(BaseDataset):
+#     def __init__(self, cfg, device='cuda:0'):
+#         super(DROIDW, self).__init__(cfg, device)
+        
+#         # Load all image paths
+#         color_paths_all = sorted(
+#             glob.glob(os.path.join(self.input_folder, 'images_anonymized', '*.jpg')) +
+#             glob.glob(os.path.join(self.input_folder, 'images_anonymized', '*.png'))
+#         )
+#         if len(color_paths_all) == 0:
+#             raise FileNotFoundError(f"No images found in {os.path.join(self.input_folder, 'images_anonymized')}")
+            
+#         tstamp_image = np.array([float(os.path.splitext(os.path.basename(p))[0]) for p in color_paths_all])
+
+#         # Load poses from traj_gt_fastlivo.txt (or traj_gt_fastlio.txt)
+#         pose_file = os.path.join(self.input_folder, 'traj_gt_fastlivo.txt')
+#         if not os.path.exists(pose_file):
+#             pose_file = os.path.join(self.input_folder, 'traj_gt.txt')
+            
+#         if not os.path.exists(pose_file):
+#             raise FileNotFoundError(f"No pose file found at {self.input_folder} (tried traj_gt_fastlivo.txt and traj_gt_fastlio.txt)")
+            
+#         pose_data = np.loadtxt(pose_file, dtype=np.float64)
+#         if pose_data.ndim == 1:
+#             pose_data = pose_data[None, :]
+#         tstamp_pose = pose_data[:, 0]
+#         pose_vecs = pose_data[:, 1:]
+
+#         # Associate images and poses
+#         max_dt = 0.05
+#         associations = []
+#         for k, tp in enumerate(tstamp_pose):
+#             i = np.argmin(np.abs(tstamp_image - tp))
+#             dt = np.abs(tstamp_image[i] - tp)
+#             if dt < max_dt:
+#                 associations.append((i, k))
+        
+#         associations = sorted(associations, key=lambda x: x[0])
+        
+#         self.color_paths = []
+#         self.poses = []
+#         inv_pose = None
+#         for i, k in associations:
+#             self.color_paths.append(color_paths_all[i])
+#             c2w = self.pose_matrix_from_quaternion(pose_vecs[k])
+#             if inv_pose is None:
+#                 inv_pose = np.linalg.inv(c2w)
+#                 c2w = np.eye(4)
+#             else:
+#                 c2w = inv_pose @ c2w
+#             self.poses.append(c2w)
+            
+#         self.w2c_first_pose = inv_pose
+#         self.depth_paths = None
+
+#         stride = cfg['stride']
+#         max_frames = cfg['max_frames']
+#         if max_frames < 0:
+#             max_frames = len(self.color_paths)
+
+#         self.color_paths = self.color_paths[:max_frames][::stride]
+#         self.poses = self.poses[:max_frames][::stride]
+#         self.n_img = len(self.color_paths)
+#         print("INFO: {} images got for DROIDW dataset!".format(self.n_img))
+
+#     def pose_matrix_from_quaternion(self, pvec):
+#         """ convert 4x4 pose matrix to (t, q) """
+#         from scipy.spatial.transform import Rotation
+
+#         pose = np.eye(4)
+#         pose[:3, :3] = Rotation.from_quat(pvec[3:]).as_matrix()
+#         pose[:3, 3] = pvec[:3]
+#         return pose
 class DROIDW(BaseDataset):
     def __init__(self, cfg, device='cuda:0'):
         super(DROIDW, self).__init__(cfg, device)
         
-        # Load all image paths
-        color_paths_all = sorted(
-            glob.glob(os.path.join(self.input_folder, 'images_anonymized', '*.jpg')) +
-            glob.glob(os.path.join(self.input_folder, 'images_anonymized', '*.png'))
-        )
-        if len(color_paths_all) == 0:
-            raise FileNotFoundError(f"No images found in {os.path.join(self.input_folder, 'images_anonymized')}")
-            
-        tstamp_image = np.array([float(os.path.splitext(os.path.basename(p))[0]) for p in color_paths_all])
-
-        # Load poses from traj_gt_fastlivo.txt (or traj_gt_fastlio.txt)
-        pose_file = os.path.join(self.input_folder, 'traj_gt_fastlivo.txt')
-        if not os.path.exists(pose_file):
-            pose_file = os.path.join(self.input_folder, 'traj_gt.txt')
-            
-        if not os.path.exists(pose_file):
-            raise FileNotFoundError(f"No pose file found at {self.input_folder} (tried traj_gt_fastlivo.txt and traj_gt_fastlio.txt)")
-            
-        pose_data = np.loadtxt(pose_file, dtype=np.float64)
-        if pose_data.ndim == 1:
-            pose_data = pose_data[None, :]
-        tstamp_pose = pose_data[:, 0]
-        pose_vecs = pose_data[:, 1:]
-
-        # Associate images and poses
-        max_dt = 0.05
-        associations = []
-        for k, tp in enumerate(tstamp_pose):
-            i = np.argmin(np.abs(tstamp_image - tp))
-            dt = np.abs(tstamp_image[i] - tp)
-            if dt < max_dt:
-                associations.append((i, k))
-        
-        associations = sorted(associations, key=lambda x: x[0])
-        
-        self.color_paths = []
-        self.poses = []
-        inv_pose = None
-        for i, k in associations:
-            self.color_paths.append(color_paths_all[i])
-            c2w = self.pose_matrix_from_quaternion(pose_vecs[k])
-            if inv_pose is None:
-                inv_pose = np.linalg.inv(c2w)
-                c2w = np.eye(4)
-            else:
-                c2w = inv_pose @ c2w
-            self.poses.append(c2w)
-            
-        self.w2c_first_pose = inv_pose
+        self.color_paths = sorted(glob.glob(f'{self.input_folder}/images_anonymized/*.jpg'))
         self.depth_paths = None
-
+        self.poses = None
+        
         stride = cfg['stride']
         max_frames = cfg['max_frames']
         if max_frames < 0:
             max_frames = len(self.color_paths)
-
+            
         self.color_paths = self.color_paths[:max_frames][::stride]
-        self.poses = self.poses[:max_frames][::stride]
+        
+        # Load poses
+        pose_files = glob.glob(f'{self.input_folder}/*.txt')
+        pose_file = None
+        for pf in pose_files:
+            if "timestamps.txt" not in pf:
+                pose_file = pf
+                break
+                
+        if pose_file is not None:
+            self.load_poses(pose_file)
+            
+        if self.poses is not None:
+            self.poses = self.poses[:max_frames][::stride]
+            
+        # save timestamp of rgb image to a txt file
+        output_folder = cfg["data"]["output"] + "/" + cfg["scene"]
+        os.makedirs(output_folder, exist_ok=True)
+        with open(os.path.join(output_folder, 'timestamps.txt'), 'w') as f:
+            for color_path in self.color_paths:
+                timestamp = float(os.path.basename(color_path)[:-4])
+                f.write(f"{timestamp}\n")
         self.n_img = len(self.color_paths)
-        print("INFO: {} images got for DROIDW dataset!".format(self.n_img))
+        print("INFO: {} images got!".format(self.n_img))
 
-    def pose_matrix_from_quaternion(self, pvec):
-        """ convert 4x4 pose matrix to (t, q) """
-        from scipy.spatial.transform import Rotation
+    def load_poses(self, path):
+        # The file is TUM format: timestamp tx ty tz qx qy qz qw
+        # we need to match the timestamps of images with the poses.
+        pose_data = np.loadtxt(path, delimiter=' ', dtype=np.unicode_, skiprows=0)
+        # handle possible comments in the first line
+        if pose_data.shape[0] > 0 and pose_data[0, 0].startswith('#'):
+            pose_data = pose_data[1:]
+            
+        tstamp_pose = pose_data[:, 0].astype(np.float64)
+        pose_vecs = pose_data[:, 1:].astype(np.float64)
+        
+        tstamp_image = np.array([float(os.path.basename(p)[:-4]) for p in self.color_paths])
+        
+        max_dt = 0.08
+        self.poses = np.full((len(self.color_paths), 4, 4), np.nan)
+        
+        first_pose_inv = None
+        for i, t in enumerate(tstamp_image):
+            k = np.argmin(np.abs(tstamp_pose - t))
+            if np.abs(tstamp_pose[k] - t) < max_dt:
+                pvec = pose_vecs[k]
+                pose = np.eye(4)
+                pose[:3, :3] = Rotation.from_quat(pvec[3:]).as_matrix()
+                pose[:3, 3] = pvec[:3]
+                
+                if first_pose_inv is None:
+                    first_pose_inv = np.linalg.inv(pose)
+                    self.w2c_first_pose = first_pose_inv
+                
+                self.poses[i] = first_pose_inv @ pose
 
-        pose = np.eye(4)
-        pose[:3, :3] = Rotation.from_quat(pvec[3:]).as_matrix()
-        pose[:3, 3] = pvec[:3]
-        return pose
 
 class Dycheck(BaseDataset):
     """This is from splat-slam, never test it (todo)"""
