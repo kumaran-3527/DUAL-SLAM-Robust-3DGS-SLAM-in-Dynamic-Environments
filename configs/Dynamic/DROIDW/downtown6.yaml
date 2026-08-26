@@ -5,11 +5,9 @@ data:
   input_folder: ROOT_FOLDER_PLACEHOLDER/downtown6
 
 mapping:
-  pcd_downsample: 32 # (Changed from 32) Spawn denser geometry for a richer uncertainty signal
-  final_refine_iters: 0
   online_plotting: False # Turn off to save disk I/O and rendering time
   Training:
-    alpha: 0.9 # Increase this value to make rendering loss weighs more on rgb rather than depth
+    alpha: 0.8 # Increase this value to make rendering loss weighs more on rgb rather than depth
 
   uncertainty_params:
     uncer_depth_mult: 0.00

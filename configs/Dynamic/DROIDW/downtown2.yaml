@@ -4,3 +4,7 @@ scene: downtown2
 data:
   input_folder: ROOT_FOLDER_PLACEHOLDER/downtown2
 
+mapping:
+  online_plotting: False # Turn off to save disk I/O and rendering time
+  Training:
+    alpha: 0.7 # Increase this value to make rendering loss weighs more on rgb rather than depth
