@@ -140,6 +140,8 @@ def get_loss_mapping_rgbd(config, image, depth, viewpoint):
     depth_pixel_mask = (gt_depth > 0.01).view(*depth.shape)
     l1_depth = torch.abs(depth * depth_pixel_mask - gt_depth * depth_pixel_mask)
 
+    if not config.get("use_metric_depth", True):
+        return loss.mean()
     return alpha * loss.mean() + (1 - alpha) * l1_depth.mean()
 
 
@@ -259,12 +261,19 @@ def get_loss_mapping_uncertainty(
     if freeze_uncertainty_loss:
         uncer_loss = uncer_loss.detach()
 
-    # Combine all losses
-    total_loss = (
-        alpha * rgb_loss.mean() +
-        (1 - alpha) * l1_depth.mean() +
-        config["uncertainty_params"]["ssim_mult"] * uncer_loss.mean()
-    )
+    if not config.get("use_metric_depth", True):
+        # Completely ignore the depth loss component
+        total_loss = (
+            rgb_loss.mean() +
+            config["uncertainty_params"]["ssim_mult"] * uncer_loss.mean()
+        )
+    else:
+        # Combine all losses
+        total_loss = (
+            alpha * rgb_loss.mean() +
+            (1 - alpha) * l1_depth.mean() +
+            config["uncertainty_params"]["ssim_mult"] * uncer_loss.mean()
+        )
 
     # Experience Replay Distillation: align mapper with geometric pseudo-labels from tracker
     if geom_label is not None:

@@ -61,6 +61,8 @@ class Mapper(object):
         torch.autograd.set_detect_anomaly(True)
 
         self.config = slam.cfg
+        # Inject tracking's use_metric_depth into mapping config for slam_utils to read
+        self.config["mapping"]["use_metric_depth"] = self.config["tracking"].get("use_metric_depth", True)
         self.printer: Printer = slam.printer
         self.pipe = pipe
         self.verbose = slam.verbose
@@ -142,7 +144,9 @@ class Mapper(object):
         self.q_main2vis = q_main2vis
         self.q_vis2main = q_vis2main
         self.pause = False
-
+        # Video writer for online showcase video streaming
+        self.showcase_video_writer = None
+        
     def run(self):
         """
         Trigger mapping process, get estimated pose and depth from tracking process,
@@ -278,6 +282,8 @@ class Mapper(object):
             if self.config['gui']:
                 self._send_to_gui(video_idx)
 
+            # (Online video streaming has been removed in favor of a single post-refine offline pass)
+
             if not self.config['mapping'].get('async_tracker', True):
                 self.pipe.send("continue")
 
@@ -340,7 +346,10 @@ class Mapper(object):
             load_feature_suffix = ""
 
         # Load metric depth
-        metric_depth = load_metric_depth(frame_idx, self.save_dir).to(self.device)
+        if self.config['tracking'].get('use_metric_depth', True):
+            metric_depth = load_metric_depth(frame_idx, self.save_dir).to(self.device)
+        else:
+            metric_depth = None
 
         # Load features if uncertainty-aware
         if self.uncertainty_aware:
@@ -394,9 +403,12 @@ class Mapper(object):
                 depth_updated = None
                 invalid = False
             else:
-                metric_depth = load_metric_depth(frame_idx, self.save_dir).to(
-                    self.device
-                )
+                if self.config['tracking'].get('use_metric_depth', True):
+                    metric_depth = load_metric_depth(frame_idx, self.save_dir).to(
+                        self.device
+                    )
+                else:
+                    metric_depth = None
                 depth_updated, w2c_updated, invalid = self.get_w2c_and_depth(
                     keyframe_idx, frame_idx, metric_depth
                 )
@@ -617,7 +629,11 @@ class Mapper(object):
             invalid = False
 
         est_frontend_depth[~valid_depth_mask] = 0
-        if not invalid:
+        if not self.config['tracking'].get('use_metric_depth', True):
+            # Completely rely on DROID-SLAM sparse depth; do not attempt to fill holes with mono_depth
+            return est_frontend_depth, w2c, invalid
+            
+        if not invalid and mono_depth is not None:
             mono_depth[mono_depth > 4 * mono_depth.mean()] = 0
             mono_depth = mono_depth.cpu().numpy()
             binary_image = (mono_depth > 0).astype(int)
@@ -1525,7 +1541,7 @@ class Mapper(object):
         return stm, ltm
 
     @torch.no_grad()
-    def save_fig_everything(self, keyframe_idx: int, plot_dir: str, suffix: str = "", depth_max: float = 10.0):
+    def save_fig_everything(self, keyframe_idx: int, plot_dir: str, suffix: str = "", depth_max: float = 10.0, metrics: dict = None, precomputed_render: dict = None):
         """
         Saves various visualizations for a specific keyframe.
 
@@ -1541,9 +1557,12 @@ class Mapper(object):
         - depth_max (float, optional): Maximum depth value for visualization. Defaults to 10.0.
         """
         viewpoint = self.cameras[keyframe_idx]
-        render_pkg = render(
-            viewpoint, self.gaussians, self.pipeline_params, self.background
-        )
+        if precomputed_render is None:
+            render_pkg = render(
+                viewpoint, self.gaussians, self.pipeline_params, self.background
+            )
+        else:
+            render_pkg = precomputed_render
         (rendered_img, rendered_depth,) = (
             render_pkg["render"].detach(),
             render_pkg["depth"].detach(),
@@ -1603,7 +1622,13 @@ class Mapper(object):
         axs[0, 0].set_title("Ground Truth RGB", fontsize=16)
         
         axs[0, 1].imshow(rendered_img.cpu().permute(1, 2, 0))
-        axs[0, 1].set_title("Rendered RGB, PSNR: {:.2f}".format(psnr_score.item()), fontsize=16)
+        if metrics is not None:
+            psnr_val = metrics.get('psnr', 0.0)
+            ssim_val = metrics.get('ssim', 0.0)
+            lpips_val = metrics.get('lpips', 0.0)
+            axs[0, 1].set_title(f"Rendered RGB\nPSNR: {psnr_val:.2f}, SSIM: {ssim_val:.3f}, LPIPS: {lpips_val:.3f}", fontsize=12)
+        else:
+            axs[0, 1].set_title("Rendered RGB, PSNR: {:.2f}".format(psnr_score.item()), fontsize=16)
         
         axs[0, 2].imshow(ssim_loss, cmap='jet', vmin=0, vmax=5)
         axs[0, 2].set_title("SSIM Loss", fontsize=16)
@@ -1660,7 +1685,7 @@ class Mapper(object):
         create_gif_from_directory(plot_dir, plot_dir + '/output.gif', duration=300, online=True)
 
     @torch.no_grad()
-    def eval_mapping_metrics(self, suffix=""):
+    def eval_mapping_metrics(self, suffix="", plot_dir=None):
         import json
         import csv
         from thirdparty.gaussian_splatting.utils.image_utils import psnr
@@ -1668,6 +1693,10 @@ class Mapper(object):
         
         step_name = f" ({suffix})" if suffix else ""
         self.printer.print(f"Evaluating Mapping Metrics{step_name}...", FontColor.INFO)
+        
+        if plot_dir is not None:
+            from thirdparty.gaussian_splatting.utils.system_utils import mkdir_p
+            mkdir_p(plot_dir)
         
         import lpips as lpips_lib
         cal_lpips = lpips_lib.LPIPS(net="alex", spatial=True).to(self.device)
@@ -1713,7 +1742,6 @@ class Mapper(object):
                 # The whole image is masked out, skip metric calculation
                 continue
             
-            # PSNR: purely pixel-wise, use only background pixels
             psnr_score = psnr(rendered_img[:, mask].unsqueeze(0), gt_image[:, mask].unsqueeze(0)).item()
             
             # SSIM: sliding-window metric, must compute on full image then average over background
@@ -1731,6 +1759,14 @@ class Mapper(object):
             ssim_array.append(ssim_score)
             lpips_array.append(lpips_score)
             
+            if plot_dir is not None:
+                metrics = {
+                    'psnr': psnr_score,
+                    'ssim': ssim_score,
+                    'lpips': lpips_score
+                }
+                self.save_fig_everything(kf_idx, plot_dir, metrics=metrics, precomputed_render=render_pkg)
+            
         mean_psnr = float(np.mean(psnr_array)) if psnr_array else 0.0
         mean_ssim = float(np.mean(ssim_array)) if ssim_array else 0.0
         mean_lpips = float(np.mean(lpips_array)) if lpips_array else 0.0
@@ -1744,6 +1780,10 @@ class Mapper(object):
             writer = csv.writer(f)
             writer.writerow(["PSNR", "SSIM", "LPIPS"])
             writer.writerow([mean_psnr, mean_ssim, mean_lpips])
+            
+        if plot_dir is not None:
+            from src.utils.plot_utils import create_gif_from_directory
+            create_gif_from_directory(plot_dir, plot_dir + '/output.gif', duration=300, online=True)
 
     @torch.no_grad()
     def _vis_uncertainty_mask_all(self, n_rows=9, n_cols=8, is_final=False):
@@ -1824,3 +1864,233 @@ class Mapper(object):
             save_path = os.path.join(self.save_dir, "online_uncer", f"{cur_idx}.png")
         plt.savefig(save_path, bbox_inches="tight")
         plt.close()
+
+    def _stream_showcase_frame(self, video_idx: int, frame_idx: int):
+        """
+        Streams a single frame to the showcase video.
+        This completely eliminates the need to save .ply files to disk.
+        """
+        import cv2
+        import numpy as np
+        import torch
+        import imgviz
+        from thirdparty.gaussian_splatting.gaussian_renderer import render
+        from src.utils.camera_utils import Camera
+        from src.utils.datasets import load_img_feature
+        
+        output_path = os.path.join(self.save_dir, "showcase_video.mp4")
+
+        # 1. Retrieve GT color
+        _, color_data, _, _ = self.frame_reader[frame_idx]
+        gt_color = color_data.to(self.device).squeeze()
+        H_orig, W_orig = gt_color.shape[1], gt_color.shape[2]
+
+        # 2. Get pose
+        c2w = self.video.get_pose(video_idx, self.device)
+        w2c = torch.inverse(c2w)
+
+        # 3. Load features
+        load_feature_suffix = "full" if self.config["mapping"]["full_resolution"] else ""
+        try:
+            features = load_img_feature(
+                frame_idx, self.save_dir, suffix=load_feature_suffix
+            ).to(self.device)
+        except Exception:
+            features = None
+
+        camera_data = {
+            "idx": video_idx,
+            "gt_color": gt_color,
+            "est_depth": np.zeros((H_orig, W_orig)),
+            "est_pose": w2c,
+            "features": features,
+        }
+        camera = Camera.init_from_dataset(
+            self.frame_reader,
+            camera_data,
+            self.projection_matrix,
+            full_resol=self.config["mapping"]["full_resolution"],
+        )
+        camera.update_RT(camera.R_gt, camera.T_gt)
+
+        # --- SPECTATOR VIEW (TRAILING BEHIND, EXACT SAME LEVEL) ---
+        spectator_c2w = c2w.clone()
+        
+        T_offset = torch.eye(4, device=self.device)
+        # Very close behind the camera (-0.1m back), exact same height (0.0)
+        T_offset[0:3, 3] = torch.tensor([0.0, 0.0, -0.1], device=self.device)
+        
+        spectator_c2w = spectator_c2w @ T_offset
+        spectator_w2c = torch.inverse(spectator_c2w)
+        
+        spectator_camera_data = camera_data.copy()
+        spectator_camera_data["est_pose"] = spectator_w2c
+        spectator_camera = Camera.init_from_dataset(
+            self.frame_reader, spectator_camera_data, self.projection_matrix, 
+            full_resol=self.config["mapping"]["full_resolution"]
+        )
+        spectator_camera.update_RT(spectator_camera.R_gt, spectator_camera.T_gt)
+        
+        with torch.no_grad():
+            spectator_render = render(spectator_camera, self.gaussians, self.pipeline_params, self.background)["render"]
+            
+        spec_img = spectator_render.detach().cpu().permute(1, 2, 0).numpy()
+        spec_img = (np.clip(spec_img, 0, 1) * 255).astype(np.uint8)
+        
+        target_h = 1080
+        scale_factor = target_h / H_orig
+        target_w = int(W_orig * scale_factor)
+        spec_img_resized = cv2.resize(spec_img, (target_w, target_h))
+        
+        # Project trajectory onto spectator view
+        traj_pts = []
+        for past_vid in self.video_idxs:
+            if past_vid <= video_idx:
+                past_c2w = self.video.get_pose(past_vid, self.device)
+                traj_pts.append(past_c2w[:3, 3].cpu().numpy())
+            
+        if len(traj_pts) > 1:
+            traj_pts = np.vstack(traj_pts)
+            pts_hmg = np.hstack([traj_pts, np.ones((traj_pts.shape[0], 1))])
+            pts_cam = (spectator_w2c.cpu().numpy() @ pts_hmg.T).T[:, :3]
+            
+            valid = pts_cam[:, 2] > 0.01
+            u = (pts_cam[:, 0] * spectator_camera.fx / np.clip(pts_cam[:, 2], 1e-5, None)) + spectator_camera.cx
+            v = (pts_cam[:, 1] * spectator_camera.fy / np.clip(pts_cam[:, 2], 1e-5, None)) + spectator_camera.cy
+            
+            u = u * (target_w / W_orig)
+            v = v * (target_h / H_orig)
+            points_2d = np.stack([u, v], axis=-1).astype(np.int32)
+            
+            for i in range(1, len(points_2d)):
+                if valid[i] and valid[i-1]:
+                    cv2.line(spec_img_resized, tuple(points_2d[i-1]), tuple(points_2d[i]), (0, 255, 0), 2, cv2.LINE_AA)
+            
+        # Draw current camera frustum
+        s = 0.08
+        frustum_local = np.array([
+            [0.0, 0.0, 0.0],
+            [s, s, s*2],
+            [-s, s, s*2],
+            [-s, -s, s*2],
+            [s, -s, s*2]
+        ])
+        
+        frustum_hmg = np.hstack([frustum_local, np.ones((5, 1))])
+        frustum_world = (c2w.cpu().numpy() @ frustum_hmg.T).T[:, :3]
+        frustum_world_hmg = np.hstack([frustum_world, np.ones((5, 1))])
+        frustum_cam = (spectator_w2c.cpu().numpy() @ frustum_world_hmg.T).T[:, :3]
+        
+        valid_frustum = frustum_cam[:, 2] > 0.01
+        u_f = (frustum_cam[:, 0] * spectator_camera.fx / np.clip(frustum_cam[:, 2], 1e-5, None)) + spectator_camera.cx
+        v_f = (frustum_cam[:, 1] * spectator_camera.fy / np.clip(frustum_cam[:, 2], 1e-5, None)) + spectator_camera.cy
+        
+        u_f = u_f * (target_w / W_orig)
+        v_f = v_f * (target_h / H_orig)
+        pts_f = np.stack([u_f, v_f], axis=-1).astype(np.int32)
+        
+        if np.all(valid_frustum):
+            color = (0, 165, 255)
+            thickness = 2
+            for i in range(1, 5):
+                cv2.line(spec_img_resized, tuple(pts_f[0]), tuple(pts_f[i]), color, thickness, cv2.LINE_AA)
+            cv2.line(spec_img_resized, tuple(pts_f[1]), tuple(pts_f[2]), color, thickness, cv2.LINE_AA)
+            cv2.line(spec_img_resized, tuple(pts_f[2]), tuple(pts_f[3]), color, thickness, cv2.LINE_AA)
+            cv2.line(spec_img_resized, tuple(pts_f[3]), tuple(pts_f[4]), color, thickness, cv2.LINE_AA)
+            cv2.line(spec_img_resized, tuple(pts_f[4]), tuple(pts_f[1]), color, thickness, cv2.LINE_AA)
+        elif len(traj_pts) > 0 and valid[-1]:
+            cv2.circle(spec_img_resized, tuple(points_2d[-1]), 6, (0, 0, 255), -1, cv2.LINE_AA)
+
+        # --- EGOCENTRIC 2x2 GRID (RIGHT SIDE) ---
+        with torch.no_grad():
+            render_pkg = render(camera, self.gaussians, self.pipeline_params, self.background)
+        rendered_image = render_pkg["render"]
+
+        gt_img = gt_color.cpu().permute(1, 2, 0).numpy()
+        gt_img = (np.clip(gt_img, 0, 1) * 255).astype(np.uint8)
+
+        rend_img = rendered_image.detach().cpu().permute(1, 2, 0).numpy()
+        rend_img = (np.clip(rend_img, 0, 1) * 255).astype(np.uint8)
+
+        if features is not None and self.uncertainty_aware:
+            try:
+                uncer_map, uncer_track = self.get_viewpoint_uncertainty_no_grad(camera)
+                uncer_m = uncer_map.cpu().squeeze().numpy()
+                uncer_m_colored = imgviz.depth2rgb(uncer_m, min_value=0.0, max_value=5.0, colormap="jet")
+                uncer_t = uncer_track.cpu().squeeze().numpy()
+            except Exception:
+                uncer_m_colored = np.zeros_like(gt_img)
+                uncer_t = np.zeros((H_orig, W_orig), dtype=np.float32)
+        else:
+            uncer_m_colored = np.zeros_like(gt_img)
+            uncer_t = np.zeros((H_orig, W_orig), dtype=np.float32)
+
+        grid_w_total = 720
+        pad_left = 40
+        half_w = grid_w_total // 2
+        half_h = int(half_w * (H_orig / W_orig))
+        
+        gt_img = cv2.resize(gt_img, (half_w, half_h))
+        rend_img = cv2.resize(rend_img, (half_w, half_h))
+        uncer_t_resized = cv2.resize(uncer_t, (half_w, half_h))
+        uncer_m_colored = cv2.resize(uncer_m_colored, (half_w, half_h))
+
+        # Overlay tracking uncertainty as semi-transparent red on original image
+        uncer_t_alpha = np.clip(uncer_t_resized, 0, 1)[..., np.newaxis]
+        alpha = uncer_t_alpha * 0.6  # Max opacity of 60%
+        red_canvas = np.zeros_like(gt_img)
+        red_canvas[:, :, 0] = 255  # Red channel in RGB
+        
+        uncer_t_overlay = (gt_img * (1 - alpha) + red_canvas * alpha).astype(np.uint8)
+
+        top_row = np.hstack((gt_img, rend_img))
+        bot_row = np.hstack((uncer_t_overlay, uncer_m_colored))
+        right_grid_tight = np.vstack((top_row, bot_row))
+        
+        right_canvas = np.zeros((target_h, grid_w_total + pad_left, 3), dtype=np.uint8)
+        y_offset = (target_h - right_grid_tight.shape[0]) // 2
+        right_canvas[y_offset:y_offset+right_grid_tight.shape[0], pad_left:pad_left+grid_w_total] = right_grid_tight
+
+        composite = np.hstack((spec_img_resized, right_canvas))
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale_main = 0.8
+        font_scale_small = 0.5
+        thick_main = 2
+        thick_small = 1
+        
+        cv2.putText(composite, '3D Map Construction (Final Refined Map)', (20, 40), font, font_scale_main, (255, 255, 255), thick_main, cv2.LINE_AA)
+        cv2.putText(composite, 'Ground Truth', (target_w + pad_left + 10, y_offset + 20), font, font_scale_small, (255, 255, 255), thick_small, cv2.LINE_AA)
+        cv2.putText(composite, 'Rendered Image', (target_w + pad_left + half_w + 10, y_offset + 20), font, font_scale_small, (255, 255, 255), thick_small, cv2.LINE_AA)
+            
+        cv2.putText(composite, 'Tracking Uncertainty', (target_w + pad_left + 10, y_offset + half_h + 20), font, font_scale_small, (255, 255, 255), thick_small, cv2.LINE_AA)
+        cv2.putText(composite, 'Mapping Uncertainty', (target_w + pad_left + half_w + 10, y_offset + half_h + 20), font, font_scale_small, (255, 255, 255), thick_small, cv2.LINE_AA)
+        
+        info_text = f'KF {video_idx} | Frame {frame_idx} | Gaussians: {self.gaussians.get_xyz.shape[0]}'
+        cv2.putText(composite, info_text, (20, target_h - 20), font, font_scale_main, (200, 255, 200), thick_main, cv2.LINE_AA)
+
+        composite_bgr = cv2.cvtColor(composite, cv2.COLOR_RGB2BGR)
+
+        if self.showcase_video_writer is None:
+            h, w = composite_bgr.shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            self.showcase_video_writer = cv2.VideoWriter(output_path, fourcc, 5, (w, h))
+
+        self.showcase_video_writer.write(composite_bgr)
+        
+    def generate_refined_showcase_video(self):
+        """
+        Streams a single pass of the showcase video after final refinement.
+        Uses the fully refined map and uncertainties.
+        """
+        self.printer.print("Generating showcase video (Final Refined)...", FontColor.MAPPER)
+        for video_idx, frame_idx in tqdm(zip(self.video_idxs, self.frame_idxs), total=len(self.video_idxs)):
+            self._stream_showcase_frame(video_idx, frame_idx)
+
+    def close_showcase_video(self):
+        if self.showcase_video_writer is not None:
+            self.showcase_video_writer.release()
+            self.showcase_video_writer = None
+            self.printer.print(f"Showcase video fully saved!", FontColor.MAPPER)
+
+

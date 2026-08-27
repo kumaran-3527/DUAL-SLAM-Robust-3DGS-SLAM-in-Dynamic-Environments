@@ -58,6 +58,25 @@ class PoseTrajectoryFiller:
         N = self.video.counter.value
         M = len(timestamps)
 
+        # Guard: clamp batch to available buffer slots
+        buffer_size = self.video.poses.shape[0]
+        available = buffer_size - N
+        if available <= 0:
+            self.printer.print(f"[WARN] Trajectory filler: buffer full (N={N}, buffer={buffer_size}), skipping batch.", FontColor.INFO)
+            return [SE3(torch.stack([torch.tensor([0,0,0,0,0,0,1], dtype=torch.float, device=self.device)] * M))]
+        if M > available:
+            self.printer.print(f"[WARN] Trajectory filler: clamping batch from {M} to {available} (buffer={buffer_size}, N={N}).", FontColor.INFO)
+            timestamps = timestamps[:available]
+            images = images[:available]
+            if depths is not None:
+                depths = depths[:available]
+            intrinsics = intrinsics[:available]
+            if dino_features is not None:
+                dino_features = dino_features[:available]
+            inputs = inputs[:available]
+            tt = tt[:available]
+            M = available
+
         ts = self.video.timestamp[:N]
         Ps = SE3(self.video.poses[:N])
 

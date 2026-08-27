@@ -28,10 +28,11 @@ class DepthVideo:
         self.wd = wd
         self.counter = Value('i', 0) # current keyframe count
         buffer = cfg['tracking']['buffer']
-        self.metric_depth_reg = cfg['tracking']['backend']['metric_depth_reg']
+        self.printer = printer
+        self.metric_depth_reg = cfg['tracking']['backend']['metric_depth_reg'] and cfg['tracking'].get('use_metric_depth', True)
         if not self.metric_depth_reg:
             self.printer.print(f"Metric depth for regularization is not activated.",FontColor.INFO)
-            self.printer.print(f"This should not happen for WildGS-SLAM unless you are doing ablation study",FontColor.INFO)
+            self.printer.print(f"This should not happen for SCOUT-SLAM unless you are doing ablation study",FontColor.INFO)
         self.mono_thres = cfg['tracking']['mono_thres']
         self.device = cfg['device']
         self.down_scale = 8
@@ -94,17 +95,23 @@ class DepthVideo:
             self.cached_ii_filtered = None
             self.cached_jj_filtered = None
 
-            from src.utils.dyn_uncertainty.uncertainty_model import LoRATrackerNet
+            from src.utils.dyn_uncertainty.uncertainty_model import LoRATrackerNet, SmallTrackerMLP
+            self.use_lora = cfg['tracking']['uncertainty_params'].get('use_lora', True)
             lora_rank = cfg['tracking']['uncertainty_params'].get('lora_rank', 8)
             lora_alpha = cfg['tracking']['uncertainty_params'].get('lora_alpha', 8.0)
             lora_lr = cfg['tracking']['uncertainty_params'].get('lora_lr', 4e-7)
             lora_wd = cfg['tracking']['uncertainty_params'].get('lora_wd', 0.1)
             
-            self.tracker_net = LoRATrackerNet(base_net=self.uncer_network.net_fast, rank=lora_rank, alpha=lora_alpha).to(self.device)
-            # Only optimize the LoRA parameters (A and B matrices)
-            lora_params = [p for n, p in self.tracker_net.named_parameters() if 'lora_' in n]
+            if self.use_lora:
+                self.tracker_net = LoRATrackerNet(base_net=self.uncer_network.net_fast, rank=lora_rank, alpha=lora_alpha).to(self.device)
+                # Only optimize the LoRA parameters (A and B matrices)
+                tracker_params = [p for n, p in self.tracker_net.named_parameters() if 'lora_' in n]
+            else:
+                self.tracker_net = SmallTrackerMLP(input_dim=384, hidden_dim=8, output_dim=1).to(self.device)
+                tracker_params = self.tracker_net.parameters()
+                
             self.tracker_optimizer = torch.optim.AdamW(
-                lora_params, lr=lora_lr, weight_decay=lora_wd
+                tracker_params, lr=lora_lr, weight_decay=lora_wd
             )
         
 
@@ -544,39 +551,32 @@ class DepthVideo:
                             grid[..., 0] = 2.0 * grid[..., 0] / (W_s - 1) - 1.0
                             grid[..., 1] = 2.0 * grid[..., 1] / (H_s - 1) - 1.0
                             
-                            # -- NEW OCCLUSION CHECK --
-                            use_occlusion = self.cfg['tracking']['uncertainty_params'].get('use_occlusion_check', False)
-                            if use_occlusion:
-                                # Sample the actual disparity of the target frame (jj) at the projected coordinates
-                                disp_jj = self.disps[jj_filtered].unsqueeze(1)  # [E_f, 1, H_s, W_s]
-                                sampled_disp_jj = torch.nn.functional.grid_sample(
-                                    disp_jj, grid, mode='bilinear', padding_mode='zeros', align_corners=True
-                                ).squeeze(1)  # [E_f, H_s, W_s]
-                                
-                                # Convert actual target inverse depth to metric depth
-                                actual_Z_target = 1.0 / (sampled_disp_jj + 1e-6)
-                                
-                                occlusion_thresh = self.cfg['tracking']['uncertainty_params'].get('occlusion_thresh', 1.15)
-                                # If the projected depth (Z_target) is much larger than the actual depth surface,
-                                # the point is occluded by something closer in the target frame.
-                                not_occluded = Z_target <= (actual_Z_target * occlusion_thresh)
-                                
-                                # Invalidating occluded pixels safely sets SCE = 0.0, avoiding false positives.
-                                geom_valid = geom_valid & not_occluded
-
-
                             jj_cpu = jj_filtered.cpu()
                             ii_cpu = ii_filtered.cpu()
 
-                            feats_jj = self.dino_feats_resize[jj_cpu].contiguous().to(self.device)
-                            feats_ii = self.dino_feats_resize[ii_cpu].contiguous().to(self.device)
+                            # Chunk the edge processing to avoid OOM from E copies of 384-dim features
+                            chunk_size = 200
+                            sce_f_list = []
+                            for start_idx in range(0, len(ii_filtered), chunk_size):
+                                end_idx = min(start_idx + chunk_size, len(ii_filtered))
+                                jj_chunk = jj_cpu[start_idx:end_idx]
+                                ii_chunk = ii_cpu[start_idx:end_idx]
+                                
+                                feats_jj_chunk = self.dino_feats_resize[jj_chunk].contiguous().to(self.device)
+                                feats_ii_chunk = self.dino_feats_resize[ii_chunk].contiguous().to(self.device)
 
-                            feats_jj.div_(feats_jj.norm(p=2, dim=1, keepdim=True).clamp_min(1e-12))
-                            feats_ii.div_(feats_ii.norm(p=2, dim=1, keepdim=True).clamp_min(1e-12))
+                                feats_jj_chunk.div_(feats_jj_chunk.norm(p=2, dim=1, keepdim=True).clamp_min(1e-12))
+                                feats_ii_chunk.div_(feats_ii_chunk.norm(p=2, dim=1, keepdim=True).clamp_min(1e-12))
 
-                            sce_f = mfc_backends.sce_feature_warp(
-                                feats_ii, feats_jj, grid, geom_valid
-                            )
+                                grid_chunk = grid[start_idx:end_idx]
+                                geom_valid_chunk = geom_valid[start_idx:end_idx]
+
+                                sce_f_chunk = mfc_backends.sce_feature_warp(
+                                    feats_ii_chunk, feats_jj_chunk, grid_chunk, geom_valid_chunk
+                                )
+                                sce_f_list.append(sce_f_chunk)
+                            
+                            sce_f = torch.cat(sce_f_list, dim=0)
 
                             if self.use_sce_init_gate and not self.is_initialized_fully:
                                 self.cached_sce_f = sce_f.detach().clone()
@@ -587,7 +587,7 @@ class DepthVideo:
                                 # Train the tracker dynamically after Stage 1
                                 if hasattr(self, 'tracker_net') and len(ii_filtered) > 0 and self.is_initialized:
                                     
-                                    if self.cfg['tracking']['uncertainty_params'].get('freeze_base', True):
+                                    if self.use_lora and self.cfg['tracking']['uncertainty_params'].get('freeze_base', True):
                                         import copy
                                         self.tracker_net.base_net = copy.deepcopy(self.uncer_network.net_fast)
                                         self.tracker_net.base_net.requires_grad_(False)
@@ -631,7 +631,7 @@ class DepthVideo:
                                             u_finals_eval = self.tracker_net(feats_bhwc)
                                             
                                             m_scale = 45.0
-                                            c_scale = 35.0
+                                            c_scale = 35.5
                                             u_finals_scaled = torch.clamp(m_scale * u_finals_eval - c_scale, min=0.1)
                                             w_uncers = torch.clamp(0.5 / (u_finals_scaled**2 + 1e-6), min=0.01, max=1.0)
                                             

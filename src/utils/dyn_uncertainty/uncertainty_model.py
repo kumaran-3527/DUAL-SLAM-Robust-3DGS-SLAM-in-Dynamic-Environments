@@ -147,13 +147,41 @@ class LoRATrackerNet(nn.Module):
         lora_out = F.linear(F.linear(x, self.lora_out_A), self.lora_out_B)
         x = base_out + lora_out * self.scaling
         x = self.softplus(x)
-
+        
         return x.view(B, H, W) if has_batch else x.view(H, W)
 
+class SmallTrackerMLP(nn.Module):
+    """
+    A standalone MLP used to ablate the LoRATrackerNet.
+    It has roughly the same parameter count (~3.1k) as the rank-8 LoRA matrices
+    to ensure a fair ablation study.
+    """
+    def __init__(self, input_dim: int = 384, hidden_dim: int = 8, output_dim: int = 1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, output_dim)
+        )
+        self.softplus = nn.Softplus()
+        
+        # Initialization
+        for m in self.net.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
-
-
-
-
-
-
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        has_batch = (x.dim() == 4)
+        if not has_batch:
+            x = x.unsqueeze(0)
+        B, H, W, C = x.shape
+        x = x.reshape(-1, C)
+        
+        x = self.net(x)
+        x = self.softplus(x)
+        
+        return x.view(B, H, W) if has_batch else x.view(H, W)

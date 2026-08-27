@@ -111,12 +111,15 @@ class SLAM:
         self.tracker.run(self.stream)
         end_time = time.time()
         
-        tracking_time = getattr(self.tracker, 'active_time', end_time - start_time)
-        tracking_fps = len(self.stream) / tracking_time if tracking_time > 0 else 0
-        self.printer.print(f"Tracking Done! (Time: {tracking_time:.2f}s, FPS: {tracking_fps:.2f})", FontColor.TRACKER)
+        elapsed_time = getattr(self.tracker, 'active_time', end_time - start_time)
+        fps = len(self.stream) / elapsed_time if elapsed_time > 0 else 0
+        peak_vram = torch.cuda.max_memory_allocated(self.device) / (1024 ** 2)
         
         with open(f"{self.save_dir}/fps_stats.txt", "a") as f:
-            f.write(f"Tracking Thread - Frames: {len(self.stream)}, Time: {tracking_time:.4f}s, FPS: {tracking_fps:.4f}\n")
+            f.write(f"Tracking FPS: {fps:.2f}\n")
+            f.write(f"Tracking Peak VRAM: {peak_vram:.2f} MB\n")
+            
+        self.printer.print("Tracking Done!", FontColor.TRACKER)
 
     def mapping(self, pipe, q_main2vis, q_vis2main):
         if self.cfg["mapping"]["uncertainty_params"]["activate"]:
@@ -136,20 +139,23 @@ class SLAM:
         self.mapper.run()
         end_time = time.time()
         
-        mapping_time = getattr(self.mapper, 'active_time', end_time - start_time)
-        mapping_fps = len(self.stream) / mapping_time if mapping_time > 0 else 0
-        self.printer.print(f"Mapping Done! (Time: {mapping_time:.2f}s, FPS: {mapping_fps:.2f})", FontColor.MAPPER)
+        elapsed_time = getattr(self.mapper, 'active_time', end_time - start_time)
+        fps = len(self.stream) / elapsed_time if elapsed_time > 0 else 0
+        peak_vram = torch.cuda.max_memory_allocated(self.device) / (1024 ** 2)
         
         with open(f"{self.save_dir}/fps_stats.txt", "a") as f:
-            f.write(f"Mapping Thread - Frames: {len(self.stream)}, Time: {mapping_time:.4f}s, FPS: {mapping_fps:.4f}\n")
+            f.write(f"Mapping FPS: {fps:.2f}\n")
+            f.write(f"Mapping Peak VRAM: {peak_vram:.2f} MB\n")
 
         # Calculate Whole Pipeline FPS BEFORE the offline terminate/evaluation functions
         pipeline_time = end_time - start_time
         pipeline_fps = len(self.stream) / pipeline_time if pipeline_time > 0 else 0
-        self.printer.print(f"Whole Pipeline Done! (Total Time: {pipeline_time:.2f}s, Overall FPS: {pipeline_fps:.2f})", FontColor.INFO)
+        self.printer.print(f"Whole Pipeline Done! (Total Time: {pipeline_time:.2f}s, Overall FPS: {pipeline_fps:.2f})", FontColor.MAPPER)
         
         with open(f"{self.save_dir}/fps_stats.txt", "a") as f:
-            f.write(f"Whole Pipeline - Frames: {len(self.stream)}, Time: {pipeline_time:.4f}s, FPS: {pipeline_fps:.4f}\n")
+            f.write(f"Overall FPS: {pipeline_fps:.2f}\n")
+            
+        self.printer.print("Mapping Done!", FontColor.MAPPER)
 
         self.terminate()
 
@@ -191,10 +197,14 @@ class SLAM:
                 except Exception as e:
                     self.printer.print(e, FontColor.ERROR)
 
-            self.mapper.save_all_kf_figs(
-                self.save_dir,
-                iteration="before_refine",
-            )
+            masked_render_eval = self.cfg["mapping"].get("masked_render_eval", False)
+            if masked_render_eval:
+                self.mapper.eval_mapping_metrics(suffix="before_refine", plot_dir=f"{self.save_dir}/plots_before_refine")
+            else:
+                self.mapper.save_all_kf_figs(
+                    self.save_dir,
+                    iteration="before_refine",
+                )
 
         if self.cfg["tracking"]["backend"]["final_ba"]:
             self.backend()
@@ -213,7 +223,8 @@ class SLAM:
             except Exception as e:
                 self.printer.print(str(e), FontColor.ERROR)
 
-        if self.cfg['mapping']['masked_render_eval'] :
+        masked_render_eval = self.cfg["mapping"].get("masked_render_eval", False)
+        if not masked_render_eval and self.cfg['mapping'].get('eval_mapping_metrics', True):
             self.mapper.eval_mapping_metrics(suffix="before_refine")
 
         if self.cfg["tracking"]["backend"]["final_ba"]:
@@ -222,19 +233,29 @@ class SLAM:
             )  # this performs a set of optimizations with RGBD loss to correct
 
         # Evaluate the metrics
-        self.mapper.save_all_kf_figs(
-            self.save_dir,
-            iteration="after_refine",
-        )
+        if masked_render_eval:
+            self.mapper.eval_mapping_metrics(suffix="after_refine", plot_dir=f"{self.save_dir}/plots_after_refine")
+        else:
+            self.mapper.save_all_kf_figs(
+                self.save_dir,
+                iteration="after_refine",
+            )
         
-        if self.cfg['mapping']['masked_render_eval'] :
+        if not masked_render_eval and self.cfg['mapping'].get('eval_mapping_metrics', True):
             self.mapper.eval_mapping_metrics(suffix="after_refine")
+
+        # Generate a second pass of the showcase video with the final refined map and uncertainties
+        self.mapper.generate_refined_showcase_video()
+
+        # Close the online showcase video stream
+        self.mapper.close_showcase_video()
 
         ## Not used, see head comments of the function
         # self._eval_depth_all(ate_statistics, global_scale, r_a, t_a)
 
         # Regenerate feature extractor for non-keyframes
         self.traj_filler.setup_feature_extractor()
+        skip_non_kf_refine = not self.cfg.get('refine_non_keyframe_poses', False)
         traj_est_not_align, _, _, dino_feats = full_traj_eval(
             self.traj_filler,
             self.mapper,
@@ -243,7 +264,7 @@ class SLAM:
             self.stream,
             self.logger,
             self.printer,
-            self.cfg['fast_mode'],
+            fast_mode=skip_non_kf_refine or self.cfg['fast_mode'],
         )
 
         if self.cfg["data"]["colmap"]["export"]:

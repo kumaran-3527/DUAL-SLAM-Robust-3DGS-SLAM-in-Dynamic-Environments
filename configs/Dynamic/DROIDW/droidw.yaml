@@ -1,6 +1,7 @@
 inherit_from: ./configs/wildgs_slam.yaml
 
 dataset: 'droidw'
+refine_non_keyframe_poses: False # if True, refine non-keyframe poses against the 3DGS map (slow, ~0.5s/frame, minimal improvement)
 
 data:
   root_folder: ./datasets/DROID-W
@@ -17,15 +18,21 @@ cam:
   distortion: [-0.152652, 0.105404, -0.000751, 0.000176, -0.020031]
   H_edge: 8
   W_edge: 8
-  H_out: 360
-  W_out: 480
+  H_out: 384
+  W_out: 512
 
 tracking:
-  buffer: 560
+  buffer: 650     # Must be > max keyframes + 16 (trajectory filler batch size)
   uncertainty_params:
     use_mapper_only_for_filler: False
     use_interpolation_for_filler: True
-    
+mapping:
+  online_plotting: False # Turn off to save disk I/O and rendering time
+  Training:
+    alpha: 0.8 # Increase this value to make rendering loss weighs more on rgb rather than depth
+
+  uncertainty_params:
+    uncer_depth_mult: 0.05
 # mapping:
 #   Training:
 #     gaussian_extent: 0.5 # Prune points that stretch too far into the background

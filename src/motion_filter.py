@@ -33,7 +33,11 @@ class MotionFilter:
         
         self.uncertainty_aware = cfg['tracking']["uncertainty_params"]['activate']
         self.save_dir = cfg['data']['output'] + '/' + cfg['scene']
-        self.metric_depth_estimator = get_metric_depth_estimator(cfg)
+        self.use_metric_depth = cfg['tracking'].get('use_metric_depth', True)
+        if self.use_metric_depth:
+            self.metric_depth_estimator = get_metric_depth_estimator(cfg)
+        else:
+            self.metric_depth_estimator = None
         if cfg['mapping']["uncertainty_params"]['activate']:
             # If mapping needs dino features, we still need feature extractor
             self.feat_extractor = get_feature_extractor(cfg)
@@ -71,7 +75,10 @@ class MotionFilter:
         if self.video.counter.value == 0:
             net, inp = self.__context_encoder(inputs[:,[0]])
             self.net, self.inp, self.fmap = net, inp, gmap
-            mono_depth = predict_metric_depth(self.metric_depth_estimator,tstamp,image,self.cfg,self.device)
+            if self.use_metric_depth:
+                mono_depth = predict_metric_depth(self.metric_depth_estimator,tstamp,image,self.cfg,self.device)
+            else:
+                mono_depth = None
             if self.uncertainty_aware:
                 dino_features = predict_img_features(self.feat_extractor,tstamp,image,self.cfg,self.device)
             else:
@@ -100,7 +107,10 @@ class MotionFilter:
                 self.count = 0
                 net, inp = self.__context_encoder(inputs[:,[0]])
                 self.net, self.inp, self.fmap = net, inp, gmap
-                mono_depth = predict_metric_depth(self.metric_depth_estimator,tstamp,image,self.cfg,self.device)
+                if self.use_metric_depth:
+                    mono_depth = predict_metric_depth(self.metric_depth_estimator,tstamp,image,self.cfg,self.device)
+                else:
+                    mono_depth = None
                 if self.uncertainty_aware:
                     dino_features = predict_img_features(self.feat_extractor,tstamp,image,self.cfg,self.device)
                 else:
