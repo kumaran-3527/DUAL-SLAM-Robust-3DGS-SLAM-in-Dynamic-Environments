@@ -316,7 +316,8 @@ def compute_mapping_loss_components(
 
 
 
-    # Adaptive Bayesian Prior: Modulate log(sigma) penalty using scaled tracker weights
+    # Adaptive Bayesian Prior: Modulate log(sigma) penalty using scaled tracker weights.
+    # Primarily, lambda(w,R) acts to regularize uncertainty inflation on static geometry (where w is high).
     if tracker_weight is not None:
         w_resampled = resample_tensor_to_shape(
             tracker_weight.detach().to(processed_uncertainty.device),
@@ -325,13 +326,16 @@ def compute_mapping_loss_components(
         )
         gamma = uncertainty_config.get('gamma', 1.0)
         
-        # Residual-Gated Prior
+        # Residual-Gated Prior (The Safety Valve)
+        # If the residual R is high due to transient noise/flicker in a static region, g(R) -> 0.
+        # This softens the penalty back to lambda_0, allowing the network to safely assign uncertainty 
+        # without forcing the 3DGS map to render the transient artifacts.
         uncer_depth_mult = uncertainty_config.get("uncer_depth_mult", 0.2)
         combined_residual = filtered_ssim_loss + uncer_depth_mult * small_depth_loss
         alpha = uncertainty_config.get('residual_gate_alpha', 0.05)
         residual_gate = torch.exp(-alpha * combined_residual)
         
-        # formulation: lambda(W) = 0.97 + gamma * W * Gate
+        # formulation: lambda(w, R) = 0.98 + gamma * w * g(R)
         log_sigma_weight = 0.98 + gamma * w_resampled * residual_gate
     else:
         log_sigma_weight = 1.0
