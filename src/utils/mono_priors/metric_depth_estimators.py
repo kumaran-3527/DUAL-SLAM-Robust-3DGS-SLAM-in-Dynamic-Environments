@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from torchvision import transforms
 import torchvision.transforms.functional as TF
 from typing import Dict, Tuple, Union
+import os
 
 from thirdparty.depth_anything_v2.metric_depth.depth_anything_v2.dpt import (
     DepthAnythingV2,
@@ -25,7 +26,9 @@ def get_metric_depth_estimator(cfg: Dict) -> torch.nn.Module:
 
     if "metric3d_vit" in depth_model:
         # Options: metric3d_vit_small, metric3d_vit_large, metric3d_vit_giant2
-        model = torch.hub.load("yvanyin/metric3d", depth_model, pretrain=True)
+        hub_dir = torch.hub.get_dir()
+        model_dir = os.path.join(hub_dir, "yvanyin_metric3d_main")
+        model = torch.hub.load(model_dir, depth_model, pretrain=True, source="local")
     elif "dpt2" in depth_model:
         model = _create_dpt2_model(depth_model)
     else:

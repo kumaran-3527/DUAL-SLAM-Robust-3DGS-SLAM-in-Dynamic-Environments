@@ -7,7 +7,9 @@ fast_mode: False
 device: "cuda:0"
 
 mapping:
-  online_plotting: True # render and save images online
+  async_tracker: False
+  masked_render_eval: False
+  online_plotting: False # render and save images online
   full_resolution: False # if using the full resolution for mapping, but we always keep downsampled size for tracking
   final_refine_iters: 20000 # iterations of final refinement, it will be forced to be 3000 if fast_mode is on
   eval_before_final_ba: False
@@ -75,9 +77,14 @@ mapping:
     reg_mult: 0.5
     ssim_mult: 0.5
     uncer_depth_mult: 0.2
+    distill_mult: 0.00
+    gamma: 2.0
+    residual_gate_alpha: 0.6
+    maturity_gating: 25
 
     lr: 0.0004
     weight_decay: 0.00001
+
 
 tracking:
   pretrained: ./pretrained/droid.pth
@@ -119,10 +126,19 @@ tracking:
     normalize: False    # whether to normalize disps after each BA iter
   uncertainty_params:
     activate: True
+    use_occlusion_check: False    # NEW: Toggle the occlusion check on/off
+    occlusion_thresh: 1.20       # NEW: 15% depth tolerance
+    lora_lr: 4.0e-7   # Using 1.0e-4 so PyYAML parses as float, not string
+    lora_wd: 0.05     
+    lora_rank: 8
+    lora_alpha: 8.0
+    freeze_base: True
   force_keyframe_every_n_frames: 9 # set to negative value if you don't want to force to insert keyframes
   nb_ref_frame_metric_depth_filtering: 6 # number of reference frames for filtering high uncertainty metric depth points
 
+
 cam:
+
   ### target/output camera settings, camera_size -> resize -> crop -> target_size
   ### original camera parameters
   H: 720
@@ -151,7 +167,7 @@ mono_prior:
 data:
   output: ./output/wildgs_slam
   colmap:
-    export: True
+    export: False
     keyframe_only: False # True for keyframes only, False for all frames
   input_folder: Please_specify_the_path_to_the_dataset
 

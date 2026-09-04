@@ -1,0 +1,13 @@
+inherit_from: ./configs/Dynamic/DROIDW/droidw.yaml
+scene: downtown6
+
+data:
+  input_folder: ROOT_FOLDER_PLACEHOLDER/downtown6
+
+mapping:
+  online_plotting: False # Turn off to save disk I/O and rendering time
+  Training:
+    alpha: 0.8 # Increase this value to make rendering loss weighs more on rgb rather than depth
+
+  uncertainty_params:
+    uncer_depth_mult: 0.00

@@ -1,0 +1,8 @@
+inherit_from: ./configs/Dynamic/DROIDW/droidw.yaml
+scene: downtown3
+
+data:
+  input_folder: ROOT_FOLDER_PLACEHOLDER/downtown3
+
+
+

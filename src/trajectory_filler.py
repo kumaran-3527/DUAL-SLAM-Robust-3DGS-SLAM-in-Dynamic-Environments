@@ -6,6 +6,8 @@ from tqdm import tqdm
 from src.utils.datasets import BaseDataset
 from src.utils.Printer import FontColor
 from src.utils.mono_priors.img_feature_extractors import predict_img_features, get_feature_extractor
+# from src.utils.mono_priors.img_feature_extractors_snd import get_feature_extractor, predict_img_features
+
 
 class PoseTrajectoryFiller:
     """ This class is used to fill in non-keyframe poses 
@@ -29,6 +31,8 @@ class PoseTrajectoryFiller:
         self.STDV = torch.tensor([0.229, 0.224, 0.225], device=device)[:, None, None]
 
         self.uncertainty_aware = cfg['tracking']["uncertainty_params"]['activate']        
+        self.use_mapper_only_for_filler = cfg['tracking']["uncertainty_params"].get('use_mapper_only_for_filler', True)
+        self.use_interpolation_for_filler = cfg['tracking']["uncertainty_params"].get('use_interpolation_for_filler', True)
         
     def setup_feature_extractor(self):
         if self.uncertainty_aware:
@@ -54,6 +58,25 @@ class PoseTrajectoryFiller:
         N = self.video.counter.value
         M = len(timestamps)
 
+        # Guard: clamp batch to available buffer slots
+        buffer_size = self.video.poses.shape[0]
+        available = buffer_size - N
+        if available <= 0:
+            self.printer.print(f"[WARN] Trajectory filler: buffer full (N={N}, buffer={buffer_size}), skipping batch.", FontColor.INFO)
+            return [SE3(torch.stack([torch.tensor([0,0,0,0,0,0,1], dtype=torch.float, device=self.device)] * M))]
+        if M > available:
+            self.printer.print(f"[WARN] Trajectory filler: clamping batch from {M} to {available} (buffer={buffer_size}, N={N}).", FontColor.INFO)
+            timestamps = timestamps[:available]
+            images = images[:available]
+            if depths is not None:
+                depths = depths[:available]
+            intrinsics = intrinsics[:available]
+            if dino_features is not None:
+                dino_features = dino_features[:available]
+            inputs = inputs[:available]
+            tt = tt[:available]
+            M = available
+
         ts = self.video.timestamp[:N]
         Ps = SE3(self.video.poses[:N])
 
@@ -78,7 +101,31 @@ class PoseTrajectoryFiller:
         self.video[N:N+M] = (tt, images[:, 0], Gs.data, 1, depths, intrinsics / 8.0, fmap, None, None, dino_features)
 
         if self.uncertainty_aware:
-            self.video.update_uncertainty_mask_given_index(range(N,N+M))
+            if self.use_interpolation_for_filler:
+                # Interpolate the uncertainty mask from adjacent keyframes based on time
+                w0 = ((ts[t1] - tt) / dt).view(-1, 1, 1)
+                w1 = (1.0 - ((ts[t1] - tt) / dt)).view(-1, 1, 1)
+                
+                self.video.uncertainties_inv[N:N+M] = (w0 * self.video.uncertainties_inv[t0] + 
+                                                       w1 * self.video.uncertainties_inv[t1])
+                self.video.mapping_uncertainties_inv[N:N+M] = (w0 * self.video.mapping_uncertainties_inv[t0] + 
+                                                               w1 * self.video.mapping_uncertainties_inv[t1])
+            else:
+                self.video.update_uncertainty_mask_given_index(range(N,N+M))
+                
+                if not self.use_mapper_only_for_filler:
+                    # Calculate scaling factors from adjacent keyframes to align scales
+                    scale_0 = (self.video.uncertainties_inv[t0] / (self.video.mapping_uncertainties_inv[t0] + 1e-6))
+                    scale_1 = (self.video.uncertainties_inv[t1] / (self.video.mapping_uncertainties_inv[t1] + 1e-6))
+                    
+                    # Interpolate the scale temporally for smooth transition
+                    w0 = ((ts[t1] - tt) / dt).view(-1, 1, 1)
+                    w1 = (1.0 - ((ts[t1] - tt) / dt)).view(-1, 1, 1)
+                    scale_interp = w0 * scale_0 + w1 * scale_1
+                    
+                    # Apply scale to the mapper MLP outputs and store in uncertainties_inv
+                    scaled_uncer = self.video.mapping_uncertainties_inv[N:N+M] * scale_interp
+                    self.video.uncertainties_inv[N:N+M] = torch.clamp(scaled_uncer, 0.0, 1.0)
 
         graph = FactorGraph(self.video, self.update)
         # build edge between current frame and nearby keyframes for optimization
@@ -99,36 +146,41 @@ class PoseTrajectoryFiller:
 
         # store all camera poses
         pose_list = []
+        # If we are interpolating, we do NOT need expensive DINO features for non-keyframes.
+        extract_dino = self.uncertainty_aware and not self.use_interpolation_for_filler
+        
         dino_feats = None
-        if self.uncertainty_aware:
+        if extract_dino:
             dino_feats = []
 
         timestamps = []
         images = []
         intrinsics = []
-        dino_features = []
+        dino_features = [] if extract_dino else None
 
         self.printer.print("Filling full trajectory ...",FontColor.INFO)
         intrinsic = image_stream.get_intrinsic()
+            
         for (timestamp, image, _ , _)  in tqdm(image_stream):
             timestamps.append(timestamp)
             images.append(image)
             intrinsics.append(intrinsic)
-            if self.uncertainty_aware:
+            
+            if extract_dino:
                 dino_feature = predict_img_features(self.feat_extractor,
                                                     timestamp,image,
                                                     self.cfg,
                                                     self.device,
                                                     save_feat=False)
                 dino_features.append(dino_feature)
-            else:
-                dino_features = None
 
             if len(timestamps) == 16:
                 pose_list += self.__fill(timestamps, images, None, intrinsics, dino_features)
                 if dino_features is not None:
                     dino_feats += dino_features 
-                timestamps, images, intrinsics, dino_features = [], [], [], []
+                timestamps, images, intrinsics = [], [], []
+                if extract_dino:
+                    dino_features = []
 
         if len(timestamps) > 0:
             pose_list += self.__fill(timestamps, images, None, intrinsics, dino_features)

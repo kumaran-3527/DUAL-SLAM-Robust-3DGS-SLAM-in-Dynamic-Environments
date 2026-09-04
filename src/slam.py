@@ -106,7 +106,19 @@ class SLAM:
             pass
         self.printer.print("Tracking Starts!", FontColor.TRACKER)
         self.printer.pbar_ready()
+        
+        start_time = time.time()
         self.tracker.run(self.stream)
+        end_time = time.time()
+        
+        elapsed_time = getattr(self.tracker, 'active_time', end_time - start_time)
+        fps = len(self.stream) / elapsed_time if elapsed_time > 0 else 0
+        peak_vram = torch.cuda.max_memory_allocated(self.device) / (1024 ** 2)
+        
+        with open(f"{self.save_dir}/fps_stats.txt", "a") as f:
+            f.write(f"Tracking FPS: {fps:.2f}\n")
+            f.write(f"Tracking Peak VRAM: {peak_vram:.2f} MB\n")
+            
         self.printer.print("Tracking Done!", FontColor.TRACKER)
 
     def mapping(self, pipe, q_main2vis, q_vis2main):
@@ -122,7 +134,27 @@ class SLAM:
         while self.all_trigered < self.num_running_thread:
             pass
         self.printer.print("Mapping Starts!", FontColor.MAPPER)
+        
+        start_time = time.time()
         self.mapper.run()
+        end_time = time.time()
+        
+        elapsed_time = getattr(self.mapper, 'active_time', end_time - start_time)
+        fps = len(self.stream) / elapsed_time if elapsed_time > 0 else 0
+        peak_vram = torch.cuda.max_memory_allocated(self.device) / (1024 ** 2)
+        
+        with open(f"{self.save_dir}/fps_stats.txt", "a") as f:
+            f.write(f"Mapping FPS: {fps:.2f}\n")
+            f.write(f"Mapping Peak VRAM: {peak_vram:.2f} MB\n")
+
+        # Calculate Whole Pipeline FPS BEFORE the offline terminate/evaluation functions
+        pipeline_time = end_time - start_time
+        pipeline_fps = len(self.stream) / pipeline_time if pipeline_time > 0 else 0
+        self.printer.print(f"Whole Pipeline Done! (Total Time: {pipeline_time:.2f}s, Overall FPS: {pipeline_fps:.2f})", FontColor.MAPPER)
+        
+        with open(f"{self.save_dir}/fps_stats.txt", "a") as f:
+            f.write(f"Overall FPS: {pipeline_fps:.2f}\n")
+            
         self.printer.print("Mapping Done!", FontColor.MAPPER)
 
         self.terminate()
@@ -165,10 +197,14 @@ class SLAM:
                 except Exception as e:
                     self.printer.print(e, FontColor.ERROR)
 
-            self.mapper.save_all_kf_figs(
-                self.save_dir,
-                iteration="before_refine",
-            )
+            masked_render_eval = self.cfg["mapping"].get("masked_render_eval", False)
+            if masked_render_eval:
+                self.mapper.eval_mapping_metrics(suffix="before_refine", plot_dir=f"{self.save_dir}/plots_before_refine")
+            else:
+                self.mapper.save_all_kf_figs(
+                    self.save_dir,
+                    iteration="before_refine",
+                )
 
         if self.cfg["tracking"]["backend"]["final_ba"]:
             self.backend()
@@ -185,7 +221,11 @@ class SLAM:
                     self.printer,
                 )
             except Exception as e:
-                self.printer.print(e, FontColor.ERROR)
+                self.printer.print(str(e), FontColor.ERROR)
+
+        masked_render_eval = self.cfg["mapping"].get("masked_render_eval", False)
+        if not masked_render_eval and self.cfg['mapping'].get('eval_mapping_metrics', True):
+            self.mapper.eval_mapping_metrics(suffix="before_refine")
 
         if self.cfg["tracking"]["backend"]["final_ba"]:
             self.mapper.final_refine(
@@ -193,16 +233,29 @@ class SLAM:
             )  # this performs a set of optimizations with RGBD loss to correct
 
         # Evaluate the metrics
-        self.mapper.save_all_kf_figs(
-            self.save_dir,
-            iteration="after_refine",
-        )
+        if masked_render_eval:
+            self.mapper.eval_mapping_metrics(suffix="after_refine", plot_dir=f"{self.save_dir}/plots_after_refine")
+        else:
+            self.mapper.save_all_kf_figs(
+                self.save_dir,
+                iteration="after_refine",
+            )
+        
+        if not masked_render_eval and self.cfg['mapping'].get('eval_mapping_metrics', True):
+            self.mapper.eval_mapping_metrics(suffix="after_refine")
+
+        # Generate a second pass of the showcase video with the final refined map and uncertainties
+        self.mapper.generate_refined_showcase_video()
+
+        # Close the online showcase video stream
+        self.mapper.close_showcase_video()
 
         ## Not used, see head comments of the function
         # self._eval_depth_all(ate_statistics, global_scale, r_a, t_a)
 
         # Regenerate feature extractor for non-keyframes
         self.traj_filler.setup_feature_extractor()
+        skip_non_kf_refine = not self.cfg.get('refine_non_keyframe_poses', False)
         traj_est_not_align, _, _, dino_feats = full_traj_eval(
             self.traj_filler,
             self.mapper,
@@ -211,7 +264,7 @@ class SLAM:
             self.stream,
             self.logger,
             self.printer,
-            self.cfg['fast_mode'],
+            fast_mode=skip_non_kf_refine or self.cfg['fast_mode'],
         )
 
         if self.cfg["data"]["colmap"]["export"]:
@@ -226,6 +279,13 @@ class SLAM:
             )
 
         self.printer.print("Metrics Evaluation Done!", FontColor.EVAL)
+
+        # Cleanup: Delete the heavy mono_priors disk cache to free up memory
+        import shutil
+        mono_priors_dir = os.path.join(self.save_dir, "mono_priors")
+        if os.path.exists(mono_priors_dir):
+            shutil.rmtree(mono_priors_dir)
+            self.printer.print("Cleaned up mono_priors disk cache.", FontColor.INFO)
 
     def save_colmap_format_kf_dynrm(self, traj_est, dino_feats=None, keyframe_only=True):
         import shutil
@@ -385,6 +445,8 @@ class SLAM:
         self.num_running_thread += len(processes)
         if self.cfg['gui']:
             self.num_running_thread += 1
+            
+        start_time = time.time()
         for p in processes:
             p.start()
 
@@ -410,6 +472,10 @@ class SLAM:
 
         for p in processes:
             p.join()
+
+        end_time = time.time()
+        pipeline_time_with_eval = end_time - start_time
+        self.printer.print(f"System Shutdown. (Total Time including offline eval: {pipeline_time_with_eval:.2f}s)", FontColor.INFO)
 
         self.printer.terminate()
 

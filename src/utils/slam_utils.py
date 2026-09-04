@@ -140,6 +140,8 @@ def get_loss_mapping_rgbd(config, image, depth, viewpoint):
     depth_pixel_mask = (gt_depth > 0.01).view(*depth.shape)
     l1_depth = torch.abs(depth * depth_pixel_mask - gt_depth * depth_pixel_mask)
 
+    if not config.get("use_metric_depth", True):
+        return loss.mean()
     return alpha * loss.mean() + (1 - alpha) * l1_depth.mean()
 
 
@@ -154,7 +156,7 @@ def get_loss_mapping_uncertainty(
     ssim_frac: float,
     initialization: bool = False,
     freeze_uncertainty_loss: bool = False,
-    flow_residual_weight: Tensor = None,  # [H/8, W/8] normalised to [0,1]
+    geom_label: Tensor = None,  # [H/8, W/8] geometric pseudo-label from tracker (experience replay)
 ) -> Tuple[Tensor, Tensor]:
     """Compute mapping loss with uncertainty estimation for SLAM system.
     
@@ -200,15 +202,17 @@ def get_loss_mapping_uncertainty(
     # Compute SSIM loss if enabled
     ssim_loss = 1.0 - ssim(rendered_img, gt_img) if config["Training"]["ssim_loss"] else 0.0
 
-    # Predict uncertainty from DINOv2 features.
-    # Note: flow_residual_weight and image_gradient are passed separately to
-    # uncertainty_network for computing the Mixture-of-Experts UKD loss.
+    # Note: uncertainty_network takes DINOv2 features and outputs the mapping uncertainty.
     features = viewpoint.features.to(device=rendered_img.device)
-    u_fast, _, u_max = uncertainty_network(
-        features, 
-        dino_warp_scores=flow_residual_weight, 
-        image_grad=viewpoint.grad_mask.to(features.device) if viewpoint.grad_mask is not None else None
-    )
+    u_fast, _ = uncertainty_network(features)
+
+    # Compute scaled tracking weight (W) to use as the Adaptive Bayesian Prior penalty
+    tracker_weight = None
+    if geom_label is not None:
+        m_scale = 45.0
+        c_scale = 35.5
+        u_final_scaled = torch.clamp(m_scale * geom_label - c_scale, min=0.1)
+        tracker_weight = torch.clamp(0.5 / (u_final_scaled**2 + 1e-6), min=0.01, max=1.0)
 
      # Compute mapping losses with uncertainty
     uncer_loss, uncer_resized, l1_rgb, l1_depth = map_utils.compute_mapping_loss_components(
@@ -217,13 +221,13 @@ def get_loss_mapping_uncertainty(
         ref_depth,
         rendered_depth,
         u_fast,
-        u_max,
+        u_fast,
         opacity.view(*mask_shape),
         train_fraction=train_frac,
         ssim_fraction=ssim_frac,
         uncertainty_config=config["uncertainty_params"],
         mask=rgb_pixel_mask,
-        flow_residual_weight=flow_residual_weight,
+        tracker_weight=tracker_weight,
     )
 
     # Combine RGB losses
@@ -257,13 +261,50 @@ def get_loss_mapping_uncertainty(
     if freeze_uncertainty_loss:
         uncer_loss = uncer_loss.detach()
 
-    # Combine all losses
-    total_loss = (
-        alpha * rgb_loss.mean() +
-        (1 - alpha) * l1_depth.mean() +
-        config["uncertainty_params"]["ssim_mult"] * uncer_loss.mean()
-    )
+    if not config.get("use_metric_depth", True):
+        # Completely ignore the depth loss component
+        total_loss = (
+            rgb_loss.mean() +
+            config["uncertainty_params"]["ssim_mult"] * uncer_loss.mean()
+        )
+    else:
+        # Combine all losses
+        total_loss = (
+            alpha * rgb_loss.mean() +
+            (1 - alpha) * l1_depth.mean() +
+            config["uncertainty_params"]["ssim_mult"] * uncer_loss.mean()
+        )
 
+    # Experience Replay Distillation: align mapper with geometric pseudo-labels from tracker
+    if geom_label is not None:
+        geom_label_resized = F.interpolate(
+            geom_label.unsqueeze(0).unsqueeze(0),
+            size=u_fast.shape,
+            mode='bilinear',
+            align_corners=False,
+        ).squeeze(0).squeeze(0)
+        distill_mult = config["uncertainty_params"].get("distill_mult", 0.01)
+        
+        # Z-Score Distillation: Normalize both to mean=0, std=1 before L1.
+        # This forces the Mapper to learn the Tracker's geometric *contrast* pattern
+        # (which pixels are dynamic vs static) without fighting over absolute scale.
+        # Z-Score L1 magnitude is ~0.8 (expected |N(0,1) - N(0,1)|), so at
+        # distill_mult=0.01 this contributes ~0.008 — about 2-5% of total_loss.
+        u_fast_norm = (u_fast - u_fast.mean()) / u_fast.std().clamp(min=0.1)
+        geom_label_norm = (geom_label_resized - geom_label_resized.mean()) / geom_label_resized.std().clamp(min=0.1)
+        
+        tracker_weight_resized = F.interpolate(
+            tracker_weight.unsqueeze(0).unsqueeze(0),
+            size=u_fast.shape,
+            mode='bilinear',
+            align_corners=False,
+        ).squeeze(0).squeeze(0)
+        
+        distill_loss = (tracker_weight_resized.detach() * (u_fast_norm - geom_label_norm.detach()).abs()).mean()
+        # print("distill_loss", distill_loss.item(), "total_loss", total_loss.item())
+
+        total_loss = total_loss + distill_mult * distill_loss
+        
     return u_fast, total_loss
 
 def get_median_depth(depth, opacity=None, mask=None, return_std=False):

@@ -25,12 +25,15 @@ def align_kf_traj(npz_path,stream,return_full_est_traj=False,printer=None):
 
     for i in range(video_timestamps.shape[0]):
         timestamp = int(video_timestamps[i])
-        val = stream.poses[timestamp].sum()
+        gt_pose = stream.poses[timestamp]
+        if gt_pose is None:
+            continue
+        val = gt_pose.sum()
         if np.isnan(val) or np.isinf(val):
             printer.print(f'Nan or Inf found in gt poses, skipping {i}th pose!',FontColor.INFO)
             continue
         traj_est.append(video_traj[i])
-        traj_ref.append(stream.poses[timestamp])
+        traj_ref.append(gt_pose)
         timestamps.append(video_timestamps[i])
 
     from evo.core.trajectory import PoseTrajectory3D

@@ -1,0 +1,44 @@
+inherit_from: ./configs/wildgs_slam.yaml
+
+dataset: 'droidw'
+refine_non_keyframe_poses: False # if True, refine non-keyframe poses against the 3DGS map (slow, ~0.5s/frame, minimal improvement)
+
+data:
+  root_folder: ./datasets/DROID-W
+  output: ./output/DROID-W
+
+cam:
+  ### target/output camera settings, camera_size -> resize -> crop -> target_size
+  H: 1200
+  W: 1600
+  fx: 893.342715
+  fy: 894.663808
+  cx: 778.820175
+  cy: 588.956733
+  distortion: [-0.152652, 0.105404, -0.000751, 0.000176, -0.020031]
+  H_edge: 8
+  W_edge: 8
+  H_out: 384
+  W_out: 512
+
+tracking:
+  buffer: 650     # Must be > max keyframes + 16 (trajectory filler batch size)
+  uncertainty_params:
+    use_mapper_only_for_filler: False
+    use_interpolation_for_filler: True
+mapping:
+  online_plotting: False # Turn off to save disk I/O and rendering time
+  Training:
+    alpha: 0.8 # Increase this value to make rendering loss weighs more on rgb rather than depth
+
+  uncertainty_params:
+    uncer_depth_mult: 0.05
+# mapping:
+#   Training:
+#     gaussian_extent: 0.5 # Prune points that stretch too far into the background
+#     size_threshold: 15 # Prune points that occupy too much screen radius
+#     gaussian_th: 0.85 # Aggressive opacity threshold to instantly kill transparent floaters
+#     gaussian_update_every: 1000 # Prune frequently to clear out old points
+#   opt_params:
+#     opacity_reset_interval: 60000 # Critical: Disable opacity resets to prevent cloning waves
+#     densify_grad_threshold: 0.0015 # Critical: Stricter cloning limit to prevent explosive point spawning

@@ -237,19 +237,27 @@ class SLAM_GUI:
         self.output_info = gui.Label("Number of Gaussians: ")
         tab_info.add_child(self.output_info)
 
-        self.in_rgb_widget = gui.ImageWidget()
+        self.in_original_img_widget = gui.ImageWidget()
+        self.in_rendered_img_widget = gui.ImageWidget()
         self.in_depth_widget = gui.ImageWidget()
-        self.in_uncertainty_widget = gui.ImageWidget()
-        self.in_uncertainty_stm_widget = gui.ImageWidget()
-        self.in_uncertainty_ltm_widget = gui.ImageWidget()
-        tab_info.add_child(gui.Label("Input Color, Metric Depth, Estimated Uncertainty"))
-        tab_info.add_child(self.in_rgb_widget)
+        self.in_ssim_widget = gui.ImageWidget()
+        self.in_u_map_widget = gui.ImageWidget()
+        self.in_u_track_widget = gui.ImageWidget()
+
+
+        tab_info.add_child(gui.Label("Original Image"))
+        tab_info.add_child(self.in_original_img_widget)
+        tab_info.add_child(gui.Label("Rendered Image"))
+        tab_info.add_child(self.in_rendered_img_widget)
+        tab_info.add_child(gui.Label("Depth Map"))
         tab_info.add_child(self.in_depth_widget)
-        tab_info.add_child(self.in_uncertainty_widget)
-        tab_info.add_child(gui.Label("STM Uncertainty (Mapping / Short-Term)"))
-        tab_info.add_child(self.in_uncertainty_stm_widget)
-        tab_info.add_child(gui.Label("LTM Uncertainty (Tracking / Long-Term)"))
-        tab_info.add_child(self.in_uncertainty_ltm_widget)
+        tab_info.add_child(gui.Label("L1 Error Map"))
+        tab_info.add_child(self.in_ssim_widget)
+        tab_info.add_child(gui.Label("Mapping Uncertainty"))
+        tab_info.add_child(self.in_u_map_widget)
+        tab_info.add_child(gui.Label("Tracking Uncertainty"))
+        tab_info.add_child(self.in_u_track_widget)
+
 
         tabs.add_tab("Info", tab_info)
         self.panel.add_child(tabs)
@@ -519,42 +527,33 @@ class SLAM_GUI:
             rgb = torch.clamp(gaussian_packet.gtcolor, min=0, max=1.0) * 255
             rgb = rgb.byte().permute(1, 2, 0).contiguous().cpu().numpy()
             rgb = o3d.geometry.Image(rgb)
-            self.in_rgb_widget.update_image(rgb)
+            self.in_original_img_widget.update_image(rgb)
 
-        if gaussian_packet.gtdepth is not None:
-            depth = gaussian_packet.gtdepth
-            depth = imgviz.depth2rgb(
-                depth, min_value=0, max_value=5.0, colormap="jet"
-            )
-            depth = torch.from_numpy(depth)
-            depth = torch.permute(depth, (2, 0, 1)).float()
-            depth = (depth).byte().permute(1, 2, 0).contiguous().cpu().numpy()
-            rgb = o3d.geometry.Image(depth)
-            self.in_depth_widget.update_image(rgb)
+        if gaussian_packet.rendered_img is not None:
+            rgb = torch.clamp(torch.tensor(gaussian_packet.rendered_img), min=0, max=1.0) * 255
+            rgb = rgb.byte().permute(1, 2, 0).contiguous().cpu().numpy()
+            rgb = o3d.geometry.Image(rgb)
+            self.in_rendered_img_widget.update_image(rgb)
 
-        if gaussian_packet.uncertainty is not None:
-            uncertainty = gaussian_packet.uncertainty
-            uncertainty = imgviz.depth2rgb(
-                uncertainty, min_value=0, max_value=5.0, colormap="jet"
-            )
-            uncertainty = torch.from_numpy(uncertainty)
-            uncertainty = torch.permute(uncertainty, (2, 0, 1)).float()
-            uncertainty = (uncertainty).byte().permute(1, 2, 0).contiguous().cpu().numpy()
-            rgb = o3d.geometry.Image(uncertainty)
-            self.in_uncertainty_widget.update_image(rgb)
-
-        def _render_uncertainty_to_widget(data, widget, max_val=2.0):
-            """Helper: colorize a numpy uncertainty map and push to an ImageWidget."""
+        def _render_map_to_widget(data, widget, max_val=5.0):
+            """Helper: colorize a numpy map and push to an ImageWidget."""
             if data is None:
                 return
-            colored = imgviz.depth2rgb(data, min_value=0, max_value=max_val, colormap="plasma")
+            colored = imgviz.depth2rgb(data, min_value=0, max_value=max_val, colormap="jet")
             colored = torch.from_numpy(colored)
             colored = torch.permute(colored, (2, 0, 1)).float()
             colored = colored.byte().permute(1, 2, 0).contiguous().cpu().numpy()
             widget.update_image(o3d.geometry.Image(colored))
 
-        _render_uncertainty_to_widget(gaussian_packet.uncertainty_stm, self.in_uncertainty_stm_widget)
-        _render_uncertainty_to_widget(gaussian_packet.uncertainty_ltm, self.in_uncertainty_ltm_widget)
+        _render_map_to_widget(gaussian_packet.ssim_map, self.in_ssim_widget, max_val=0.5)
+        _render_map_to_widget(gaussian_packet.u_map, self.in_u_map_widget)
+        # We now visualize (1.0 - BA_weight), which strictly ranges from 0.0 to ~0.99.
+        # Max_val=1.0 ensures dynamic objects hit the top of the Red scale perfectly.
+        _render_map_to_widget(gaussian_packet.u_track, self.in_u_track_widget, max_val=1.0)
+
+        
+        if getattr(gaussian_packet, "gtdepth", None) is not None:
+            _render_map_to_widget(gaussian_packet.gtdepth, self.in_depth_widget, max_val=10.0)
 
         if gaussian_packet.finish:
             Log("Received terminate signal", tag="GUI")

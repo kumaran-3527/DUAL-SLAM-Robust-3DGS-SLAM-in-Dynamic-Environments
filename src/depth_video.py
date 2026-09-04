@@ -2,16 +2,19 @@ import numpy as np
 import torch
 import lietorch
 import droid_backends
+import mfc_backends
 import src.geom.ba
 from torch.multiprocessing import Value
 from torch.multiprocessing import Lock
 import torch.nn.functional as F
-
+    
 from src.modules.droid_net import cvx_upsample
 import src.geom.projective_ops as pops
 from src.utils.common import align_scale_and_shift
 from src.utils.Printer import FontColor
 from src.utils.dyn_uncertainty import mapping_utils as map_utils
+from src.utils.dyn_uncertainty.mapping_utils import compute_dino_regularization_loss
+
 
 class DepthVideo:
     ''' store the estimated poses and depth maps, 
@@ -25,10 +28,11 @@ class DepthVideo:
         self.wd = wd
         self.counter = Value('i', 0) # current keyframe count
         buffer = cfg['tracking']['buffer']
-        self.metric_depth_reg = cfg['tracking']['backend']['metric_depth_reg']
+        self.printer = printer
+        self.metric_depth_reg = cfg['tracking']['backend']['metric_depth_reg'] and cfg['tracking'].get('use_metric_depth', True)
         if not self.metric_depth_reg:
             self.printer.print(f"Metric depth for regularization is not activated.",FontColor.INFO)
-            self.printer.print(f"This should not happen for WildGS-SLAM unless you are doing ablation study",FontColor.INFO)
+            self.printer.print(f"This should not happen for SCOUT-SLAM unless you are doing ablation study",FontColor.INFO)
         self.mono_thres = cfg['tracking']['mono_thres']
         self.device = cfg['device']
         self.down_scale = 8
@@ -78,9 +82,43 @@ class DepthVideo:
             self.dino_feats = torch.zeros(buffer, ht//14, wd//14, n_features, device='cpu', dtype=torch.float).share_memory_()
             self.dino_feats_resize = torch.zeros(buffer, n_features, ht//self.down_scale, wd//self.down_scale, device='cpu', dtype=torch.float).share_memory_()
             self.uncertainties_inv = torch.ones(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
-            # DINOv2 warping Semantic Consistency Error (SCE) per keyframe at 1/8 resolution.
-            # Aggregated across all BA edges touching each frame during ba().
-            self.dino_warp_scores = torch.zeros(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
+            self.mapping_uncertainties_inv = torch.ones(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
+            
+
+            
+            self.geom_uncertainty_labels = -1.0 * torch.ones(buffer, ht//self.down_scale, wd//self.down_scale, device=self.device, dtype=torch.float).share_memory_()
+            self._sce_ba_call_count = 0
+            self._sce_new_frame_pending = False
+            
+            self.use_sce_init_gate = cfg['tracking']["uncertainty_params"].get('use_sce_init_gate', False)
+            self.cached_sce_f = None
+            self.cached_ii_filtered = None
+            self.cached_jj_filtered = None
+
+            from src.utils.dyn_uncertainty.uncertainty_model import LoRATrackerNet, SmallTrackerMLP
+            self.use_lora = cfg['tracking']['uncertainty_params'].get('use_lora', True)
+            lora_rank = cfg['tracking']['uncertainty_params'].get('lora_rank', 8)
+            lora_alpha = cfg['tracking']['uncertainty_params'].get('lora_alpha', 8.0)
+            lora_lr = cfg['tracking']['uncertainty_params'].get('lora_lr', 4e-7)
+            lora_wd = cfg['tracking']['uncertainty_params'].get('lora_wd', 0.1)
+            
+            if self.use_lora:
+                self.tracker_net = LoRATrackerNet(base_net=self.uncer_network.net_fast, rank=lora_rank, alpha=lora_alpha).to(self.device)
+                # Only optimize the LoRA parameters (A and B matrices)
+                tracker_params = [p for n, p in self.tracker_net.named_parameters() if 'lora_' in n]
+            else:
+                self.tracker_net = SmallTrackerMLP(input_dim=384, hidden_dim=8, output_dim=1).to(self.device)
+                tracker_params = self.tracker_net.parameters()
+                
+            self.tracker_optimizer = torch.optim.AdamW(
+                tracker_params, lr=lora_lr, weight_decay=lora_wd
+            )
+        
+
+            self._tracker_net_trained = False
+            self.is_initialized = False
+            self.is_initialized_fully = False
+
         else:
             self.dino_feats = None
             self.dino_feats_resize = None
@@ -128,12 +166,12 @@ class DepthVideo:
 
             if len(item[9].shape) == 3:
                 self.dino_feats_resize[index] = F.interpolate(item[9].permute(2,0,1).unsqueeze(0),
-                                                            self.disps_up.shape[-2:], 
-                                                            mode='bilinear').squeeze()[:,self.slice_h,self.slice_w].cpu()
+                                                            self.disps.shape[-2:], 
+                                                            mode='bilinear').squeeze().cpu()
             else:
                 self.dino_feats_resize[index] = F.interpolate(item[9].permute(0,3,1,2),
-                                                            self.disps_up.shape[-2:], 
-                                                            mode='bilinear')[:,:,self.slice_h,self.slice_w].cpu()
+                                                            self.disps.shape[-2:], 
+                                                            mode='bilinear').cpu()
 
     def __setitem__(self, index, item):
         with self.get_lock():
@@ -290,7 +328,7 @@ class DepthVideo:
             if jj.shape[0] >= nb_frame:
                 break
             if j not in jj:
-                torch.cat((jj, j.unsqueeze(0).to(jj.device)))
+                jj = torch.cat((jj, j.unsqueeze(0).to(jj.device)))
 
         ii = torch.tensor(idx).repeat(jj.shape[0])
 
@@ -312,49 +350,109 @@ class DepthVideo:
         # projected point is valid only if its inside the image range and the depth is greater than 0
         valid_mask = (x1_rounded[..., 1] >= 0) & (x1_rounded[..., 1] < x1.shape[2]) & \
                     (x1_rounded[..., 0] >= 0) & (x1_rounded[..., 0] < x1.shape[3]) & (x1[...,2]>0)
+
+        # We need jj features. jj is a tensor of indices.
+        # feats_jj shape: [E, 384, H_feat, W_feat]
+        feats_jj = self.dino_feats[jj.cpu()].permute(0, 3, 1, 2).contiguous().to(self.device)
+        feats_jj.div_(feats_jj.norm(p=2, dim=1, keepdim=True).clamp_min(1e-12))
         
-        i_dino = F.interpolate(self.dino_feats[idx].permute(2,0,1).unsqueeze(0),
-                                self.disps_up.shape[-2:], 
-                                mode='bilinear').to(self.device).squeeze()
+        # We need ii features. ii is idx repeated E times.
+        feats_ii = self.dino_feats[ii.cpu()].permute(0, 3, 1, 2).contiguous().to(self.device)
+        feats_ii.div_(feats_ii.norm(p=2, dim=1, keepdim=True).clamp_min(1e-12))
+
+        # x1 is [1, E, H_full, W_full, 3] -> [E, H_full, W_full, 3]
+        x1_b = x1[0].contiguous()
+        valid_mask_b = valid_mask[0].contiguous()
+
+        # Execute fused zero-VRAM CUDA operation to get similarity > 0.9 mask!
+        # Remember: we pass feats_jj first (sampled at px,py) and feats_ii second (sampled at w,h)
+        matching_mask = mfc_backends.sce_feature_warp_full_res(
+            feats_jj, 
+            feats_ii, 
+            x1_b,
+            valid_mask_b
+        )
+
+        # matching_mask is [E, H, W]
+        # For each E, we have a set of matched pixels in frame i.
+        # The coordinates in frame i are x1_rounded[..., 0] and x1_rounded[..., 1].
+        x1_rounded = torch.round(x1_b[..., :2]).long()
+        
         for j_id in range(jj.shape[0]):
-            projected_j_to_i = x1[0, j_id]
-            x_coords, y_coords = x1_rounded[0, j_id, ..., 0], x1_rounded[0, j_id, ..., 1]
+            m_mask = matching_mask[j_id] & valid_mask_b[j_id]
             
-            # Select valid coordinates and their Dino features
-            j_dino = F.interpolate(self.dino_feats[jj[j_id]].permute(2,0,1).unsqueeze(0),
-                                    self.disps_up.shape[-2:], 
-                                    mode='bilinear').to(self.device).squeeze()
-            valid_x, valid_y = x_coords[valid_mask[0, j_id]], y_coords[valid_mask[0, j_id]]
-            j_dino_valid = j_dino[:, valid_mask[0, j_id]]
-            i_dino_valid = i_dino[:, valid_y, valid_x]
-
-            # Compute cosine similarity for each valid position
-            similarity = F.normalize(j_dino_valid, p=2, dim=0).mul(F.normalize(i_dino_valid, p=2, dim=0)).sum(dim=0)
-            matching_mask = similarity > 0.9
-
-            # Update projected disparity and counts based on the similarity check
-            j_projected_disp = torch.zeros_like(self.mono_disps_up[idx])
-            matched_disp = projected_j_to_i[valid_mask[0, j_id]][matching_mask]
-            matched_x, matched_y = valid_x[matching_mask], valid_y[matching_mask]
-            j_projected_disp[matched_y, matched_x] = matched_disp[..., 2]
-
-            # Error calculation and count updates
-            error = torch.abs(1 / j_projected_disp[matched_y, matched_x] - 1 / i_disp[matched_y, matched_x]) * j_projected_disp[matched_y, matched_x]
+            # Extract the 2D spatial planes for coordinates and depth
+            x_coords = x1_rounded[j_id, ..., 0]
+            y_coords = x1_rounded[j_id, ..., 1]
+            depth_plane = x1_b[j_id, ..., 2]
+            
+            # Apply the boolean mask to get valid 1D arrays
+            valid_x = x_coords[m_mask]
+            valid_y = y_coords[m_mask]
+            depth_j = depth_plane[m_mask]
+            
+            # We compare depth_j against i_disp at (valid_x, valid_y)
+            depth_i = i_disp[valid_y, valid_x]
+            
+            error = torch.abs(1.0 / depth_j - depth_i) * depth_j
             correct_mask = error < 0.02
-
-            # Batch update correct and bad counts
-            accurate_count[matched_y[correct_mask], matched_x[correct_mask]] += 1
-            inaccurate_count[matched_y[~correct_mask], matched_x[~correct_mask]] += 1
+            
+            ones = torch.ones_like(valid_y[correct_mask], dtype=accurate_count.dtype)
+            accurate_count.index_put_((valid_y[correct_mask], valid_x[correct_mask]), ones, accumulate=True)
+            
+            ones_inacc = torch.ones_like(valid_y[~correct_mask], dtype=inaccurate_count.dtype)
+            inaccurate_count.index_put_((valid_y[~correct_mask], valid_x[~correct_mask]), ones_inacc, accumulate=True)
 
         # Clean the gpu memory
         torch.cuda.empty_cache()
 
         self.mono_disps_mask_up[idx][(accurate_count<=1)&(inaccurate_count>0)&(self.mono_disps_up[idx]>0)] = False
+        
 
     def ba(self, target, weight, eta, ii, jj, t0=1, t1=None, iters=2, lm=1e-4, ep=0.1,
-           motion_only=False):
+           motion_only=False, global_ba=False):
+
         if self.uncertainty_aware:
-            weight *= self.uncertainties_inv[ii][None, :, :, :, None]
+            is_init = getattr(self, 'is_initialized', False)
+            if not is_init or not self._tracker_net_trained:
+                u_inv_i = self.mapping_uncertainties_inv[ii][None, :, :, :, None]
+                weight *= u_inv_i
+            elif motion_only:
+                use_mapper_only = self.cfg['tracking']["uncertainty_params"].get('use_mapper_only_for_filler', False)
+                if not use_mapper_only:
+                    u_inv_i = self.uncertainties_inv[ii][None, :, :, :, None]
+                else:
+                    u_inv_i = self.mapping_uncertainties_inv[ii][None, :, :, :, None]
+                weight *= u_inv_i
+            else:
+                u_inv_i = self.uncertainties_inv[ii][None, :, :, :, None] 
+                weight *=  u_inv_i
+
+            # Init-phase edge-level SCE gate (Optional)
+            if self.use_sce_init_gate and self.cached_sce_f is not None and not self.is_initialized_fully:
+                H_s = self.ht // self.down_scale
+                W_s = self.wd // self.down_scale
+                E_ba = len(ii)
+
+                match = (
+                    (ii[:, None] == self.cached_ii_filtered[None, :]) &
+                    (jj[:, None] == self.cached_jj_filtered[None, :])
+                )
+                has_match = match.any(dim=1)
+                edge_sce = torch.zeros(E_ba, H_s, W_s, device=self.device)
+                if has_match.any():
+                    match_idx = match.float().argmax(dim=1)
+                    edge_sce[has_match] = self.cached_sce_f[match_idx[has_match]]
+
+                # Conservative SCE gate: down-weight max by 50% instead of dropping completely
+                sce_gate = (1.0 - 0.5 * edge_sce)[None, ..., None]
+                weight *= sce_gate
+
+            elif self.cached_sce_f is not None and self.is_initialized_fully:
+                self.cached_sce_f = None
+                self.cached_ii_filtered = None
+                self.cached_jj_filtered = None
+
 
         with self.get_lock():
             # [t0, t1] window of bundle adjustment optimization
@@ -376,69 +474,217 @@ class DepthVideo:
             self.disps.clamp_(min=1e-5)
 
             # ── Semantic Consistency Error (SCE) via DINOv2 Warping ──
-            # After BA updates poses/disps, we warp the semantic DINOv2 features
-            # to check for rigid-semantic inconsistency. Moving objects violate 
-            # the static world assumption, causing high SCE at object boundaries.
-            if self.uncertainty_aware and not motion_only:
-                with torch.no_grad():
-                    # induced_coords: [1, E, H/8, W/8, 2] — where pixels in ii
-                    # land in jj under the current rigid pose + depth estimate.
-                    induced_coords, valid = pops.projective_transform(
-                        lietorch.SE3(self.poses[None]), self.disps[None],
-                        self.intrinsics[None], ii, jj
-                    )  # [1, E, H/8, W/8, 2]
-                    valid = valid[0, ..., 0] # [E, H/8, W/8]
+            if self.uncertainty_aware:
 
-                    # Format induced_coords for grid_sample [-1, 1]
-                    if self.dino_feats_resize is not None:
-                        W_s = self.wd // self.down_scale
-                        H_s = self.ht // self.down_scale
-                        grid = induced_coords.squeeze(0).clone() # [E, H_s, W_s, 2]
-                        grid[..., 0] = 2.0 * grid[..., 0] / (W_s - 1) - 1.0
-                        grid[..., 1] = 2.0 * grid[..., 1] / (H_s - 1) - 1.0
+                _run_sce = not global_ba and not motion_only
+                if _run_sce:
+                    self._sce_ba_call_count = 0
+                    self._sce_new_frame_pending = False
+                    with torch.no_grad():
+                        # We consider ALL edges (both active and inactive) passed to ba()
+                        window_mask = (ii >= 0) & (jj >= 0) & (ii < t1) & (jj < t1)
+                        ii_active = ii[window_mask]
+                        jj_active = jj[window_mask]
                         
-                        # Compute Semantic Consistency Error (SCE) in chunks to avoid OOM
-                        E = len(ii)
-                        chunk_size = 16 # Small chunk size to stay well within VRAM limits
-                        sce = torch.zeros(E, H_s, W_s, device=self.device, dtype=torch.float32)
-                        
-                        for chunk_start in range(0, E, chunk_size):
-                            chunk_end = min(E, chunk_start + chunk_size)
-                            
-                            # Extract and normalize only the current chunk to save VRAM
-                            jj_chunk = jj[chunk_start:chunk_end].cpu()
-                            ii_chunk = ii[chunk_start:chunk_end].cpu()
-                            
-                            feats_jj_chunk = self.dino_feats_resize[jj_chunk].to(self.device)
-                            feats_ii_chunk = self.dino_feats_resize[ii_chunk].to(self.device)
-                            
-                            feats_jj_chunk = F.normalize(feats_jj_chunk, p=2, dim=1)
-                            feats_ii_chunk = F.normalize(feats_ii_chunk, p=2, dim=1)
-                            
-                            grid_chunk = grid[chunk_start:chunk_end]
-                            
-                            warped_chunk = F.grid_sample(
-                                feats_jj_chunk, grid_chunk, mode='bilinear', padding_mode='zeros', align_corners=True
+                        if len(ii_active) > 0:
+                            gap = (ii_active - jj_active).abs()
+                            # temporal_gap_mask = (gap >= self.SCE_MIN_GAP)
+
+                            ii_filtered = ii_active
+                            jj_filtered = jj_active
+                        else:
+                            ii_filtered = torch.empty(0, dtype=torch.long, device=self.device)
+                            jj_filtered = torch.empty(0, dtype=torch.long, device=self.device)
+
+
+                        if len(ii_filtered) == 0 or self.dino_feats_resize is None:
+                            pass
+                        else:
+                            W_s = self.wd // self.down_scale
+                            H_s = self.ht // self.down_scale
+
+                            # ── Condition 2: Geometric Validity ──
+                            # Re-project source pixels into 3D and warp into target frame.
+                            # We need the 3D point in the target frame (X1) to check
+                            # the MIN_DEPTH condition.  We replicate the projective ops
+                            # inline so we can access the intermediate Z value.
+                            MIN_DEPTH_SCE = 0.25
+
+                            # Lift source pixels to 3D: X0 = [X, Y, 1, disp] in source cam
+                            X0, _ = pops.iproj(
+                                self.disps[None, ii_filtered],
+                                self.intrinsics[None, ii_filtered],
+                            )  # [1, E_f, H_s, W_s, 4]
+
+                            # Relative pose: T_jj * T_ii^{-1}
+                            poses_se3 = lietorch.SE3(self.poses[None])
+                            Gij = poses_se3[:, jj_filtered] * poses_se3[:, ii_filtered].inv()
+                            # Perturb self-edges to prevent zero-division
+                            Gij.data[:, ii_filtered == jj_filtered] = torch.as_tensor(
+                                [-0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], device=self.device
                             )
-                            sce[chunk_start:chunk_end] = 1.0 - (feats_ii_chunk * warped_chunk).sum(dim=1)
-                        
-                        # Mask out invalid pixels or out-of-bounds warping
-                        valid_mask = (valid > 0.5) & (grid[..., 0] >= -1.0) & (grid[..., 0] <= 1.0) & \
-                                     (grid[..., 1] >= -1.0) & (grid[..., 1] <= 1.0)
-                        sce[~valid_mask] = 0.0
-                        
-                        # Aggregate: for each source frame ii, keep the max SCE
-                        frame_sce = torch.zeros(
-                            self.counter.value, H_s, W_s, device=self.device
-                        )
-                        for e_idx, src in enumerate(ii.tolist()):
-                            frame_sce[src] = torch.maximum(
-                                frame_sce[src], sce[e_idx]
-                            )
-                        
-                        # We use the SCE directly as the kinematic motion expert gate M
-                        # Soft thresholding/scaling: SCE typically ranges [0, 1].
-                        self.dino_warp_scores[:self.counter.value] = torch.clamp(frame_sce * 2.0, 0.0, 1.0)
+
+                            # Apply rigid transform: X1 = Gij * X0  [1, E_f, H_s, W_s, 4]
+                            X1, _ = pops.actp(Gij, X0)
+
+                            # Project X1 into target image: x1  [1, E_f, H_s, W_s, 2]
+                            x1, _ = pops.proj(X1, self.intrinsics[None, jj_filtered])
+
+                            X1 = X1.squeeze(0)  # [E_f, H_s, W_s, 4]
+                            x1 = x1.squeeze(0)  # [E_f, H_s, W_s, 2]
+
+                            # Z-depth in the target camera frame
+                            Z_target = X1[..., 2]  # [E_f, H_s, W_s]
+
+                            # Pixel-level geometric validity: depth floor + image boundary
+                            u = x1[..., 0]  # x-coord in target image
+                            v = x1[..., 1]  # y-coord in target image
+                            geom_valid = (
+                                (Z_target >= MIN_DEPTH_SCE) &
+                                (u >= 0.0) & (u <= W_s - 1.0) &
+                                (v >= 0.0) & (v <= H_s - 1.0)
+                            )  # [E_f, H_s, W_s]
+
+                            # Build normalized grid for grid_sample from the projected coords
+                            # (reuse x1 which is already in pixel-space)
+                            grid = x1.clone()  # [E_f, H_s, W_s, 2]
+                            grid[..., 0] = 2.0 * grid[..., 0] / (W_s - 1) - 1.0
+                            grid[..., 1] = 2.0 * grid[..., 1] / (H_s - 1) - 1.0
+                            
+                            jj_cpu = jj_filtered.cpu()
+                            ii_cpu = ii_filtered.cpu()
+
+                            # Chunk the edge processing to avoid OOM from E copies of 384-dim features
+                            chunk_size = 200
+                            sce_f_list = []
+                            for start_idx in range(0, len(ii_filtered), chunk_size):
+                                end_idx = min(start_idx + chunk_size, len(ii_filtered))
+                                jj_chunk = jj_cpu[start_idx:end_idx]
+                                ii_chunk = ii_cpu[start_idx:end_idx]
+                                
+                                feats_jj_chunk = self.dino_feats_resize[jj_chunk].contiguous().to(self.device)
+                                feats_ii_chunk = self.dino_feats_resize[ii_chunk].contiguous().to(self.device)
+
+                                feats_jj_chunk.div_(feats_jj_chunk.norm(p=2, dim=1, keepdim=True).clamp_min(1e-12))
+                                feats_ii_chunk.div_(feats_ii_chunk.norm(p=2, dim=1, keepdim=True).clamp_min(1e-12))
+
+                                grid_chunk = grid[start_idx:end_idx]
+                                geom_valid_chunk = geom_valid[start_idx:end_idx]
+
+                                sce_f_chunk = mfc_backends.sce_feature_warp(
+                                    feats_ii_chunk, feats_jj_chunk, grid_chunk, geom_valid_chunk
+                                )
+                                sce_f_list.append(sce_f_chunk)
+                            
+                            sce_f = torch.cat(sce_f_list, dim=0)
+
+                            if self.use_sce_init_gate and not self.is_initialized_fully:
+                                self.cached_sce_f = sce_f.detach().clone()
+                                self.cached_ii_filtered = ii_filtered.clone()
+                                self.cached_jj_filtered = jj_filtered.clone()
+
+                            with torch.enable_grad():
+                                # Train the tracker dynamically after Stage 1
+                                if hasattr(self, 'tracker_net') and len(ii_filtered) > 0 and self.is_initialized:
+                                    
+                                    if self.use_lora and self.cfg['tracking']['uncertainty_params'].get('freeze_base', True):
+                                        import copy
+                                        self.tracker_net.base_net = copy.deepcopy(self.uncer_network.net_fast)
+                                        self.tracker_net.base_net.requires_grad_(False)
+                                        self.tracker_net.base_net.eval()
+
+                                    self.tracker_net.train()
+                                    unique_srcs = torch.unique(ii_filtered)
+                                    
+                                    if len(unique_srcs) > 0:
+                                        feats_b = self.dino_feats_resize[unique_srcs.cpu()].to(self.device)
+                                        feats_bhwc = feats_b.permute(0, 2, 3, 1)  # [N, H, W, C]
+                                        u_finals_b = self.tracker_net(feats_bhwc) # [N, H_s, W_s]
+                                        
+                                        total_loss = 0.0
+                                        for batch_idx, src_idx in enumerate(unique_srcs):
+                                            edge_mask = (ii_filtered == src_idx)
+                                            u_final = u_finals_b[batch_idx]
+                                            
+                                            sce_src = sce_f[edge_mask]
+                                            valid_src = geom_valid[edge_mask]
+                                            u_final_b = u_final.unsqueeze(0)
+                                            
+                                            L_obs = (sce_src / (u_final_b**2 + 1e-6)) + torch.log(u_final_b + 1e-6)
+                                            nll = L_obs * valid_src
+                                            n_valid = valid_src.sum().clamp(min=1.0)
+                                            total_loss += nll.sum() / n_valid
+                                            
+                                        # L2 weight decay on the A,B matrices acts as the native regularizer against the mapper.
+                                        self.tracker_optimizer.zero_grad()
+                                        total_loss.backward()
+                                        self.tracker_optimizer.step()
+                                        
+                                    self.tracker_net.eval()
+                                    self._tracker_net_trained = True
+
+                                    # Experience Replay: save geometric pseudo-labels and immediate inference
+                                    if hasattr(self, 'geom_uncertainty_labels') and len(unique_srcs) > 0:
+                                        with torch.no_grad():
+                                            # --- BATCHED FORWARD PASS (INFERENCE) ---
+                                            # We re-run batched inference in eval() mode just to be structurally safe
+                                            u_finals_eval = self.tracker_net(feats_bhwc)
+                                            
+                                            m_scale = 45.0
+                                            c_scale = 35.5
+                                            u_finals_scaled = torch.clamp(m_scale * u_finals_eval - c_scale, min=0.1)
+                                            w_uncers = torch.clamp(0.5 / (u_finals_scaled**2 + 1e-6), min=0.01, max=1.0)
+                                            
+                                            for batch_idx, src_idx in enumerate(unique_srcs):
+                                                src = src_idx.item()
+                                                self.geom_uncertainty_labels[src] = u_finals_eval[batch_idx]
+                                                self.uncertainties_inv[src] = w_uncers[batch_idx]
+
+
+
+                                                # # Visualization Hook for Convergence Timeline
+                                                # target_keyframes = [i for i in range(30,40,1)] # Edit this list to specify which keyframes to visualize
+                                                # if src in target_keyframes:
+                                                #     if not hasattr(self, 'uncer_history'):
+                                                #         self.uncer_history = {}
+                                                #     if not hasattr(self, 'ba_calls_per_frame'):
+                                                #         self.ba_calls_per_frame = {}
+                                                    
+                                                #     if src not in self.ba_calls_per_frame:
+                                                #         self.ba_calls_per_frame[src] = 0
+                                                #         self.uncer_history[src] = []
+                                                        
+                                                #     if self.ba_calls_per_frame[src] < 15:
+                                                #         tracking_uncer_map = (1.0 - w_uncers[batch_idx]).clone().cpu().numpy()
+                                                #         self.uncer_history[src].append(tracking_uncer_map)
+                                                #         self.ba_calls_per_frame[src] += 1
+                                                        
+                                                #         if self.ba_calls_per_frame[src] == 15:
+                                                #             import matplotlib.pyplot as plt
+                                                #             import os
+                                                            
+                                                #             save_dir = os.path.join(self.output, "tracker_convergence_vis")
+                                                #             os.makedirs(save_dir, exist_ok=True)
+                                                            
+                                                #             # 1 RGB image + 8 iterations (0,2,4,6,8,10,12,14)
+                                                #             fig, axs = plt.subplots(1, 9, figsize=(32, 2))
+                                                            
+                                                #             # Plot RGB Image
+                                                #             rgb_img = self.images[src].permute(1, 2, 0).cpu().numpy()
+                                                #             rgb_img = (rgb_img - rgb_img.min()) / (rgb_img.max() - rgb_img.min() + 1e-6)
+                                                #             axs[0].imshow(rgb_img)
+                                                #             axs[0].axis("off")
+                                                #             axs[0].set_title("RGB")
+                                                            
+                                                #             # Plot Iterations
+                                                #             for idx, i in enumerate(range(0,15,2)):
+                                                #                 axs[idx+1].imshow(self.uncer_history[src][i], cmap="jet", vmin=0, vmax=1.0)
+                                                #                 axs[idx+1].axis("off")
+                                                #                 axs[idx+1].set_title(f"Iter {i}")
+                                                            
+                                                #             plt.tight_layout()
+                                                #             plt.savefig(os.path.join(save_dir, f"frame_{src}_convergence_timeline.png"), bbox_inches="tight")
+                                                #             plt.close()
 
 
     def get_depth_scale_and_shift(self,index, mono_depth:torch.Tensor, est_depth:torch.Tensor, weights:torch.Tensor):
@@ -517,24 +763,26 @@ class DepthVideo:
 
         i = 0
         while i*20 < self.counter.value:
-            dino_feat_batch = self.dino_feats[i*20:min((i+1)*20,self.counter.value),:,:,:].to(self.device)
+            batch = slice(i*20, min((i+1)*20, self.counter.value))
+            dino_feat_batch = self.dino_feats[batch].to(self.device)
+            
             with Lock():
-                _, uncer, _ = self.uncer_network(dino_feat_batch)
+                u_map_raw, _ = self.uncer_network(dino_feat_batch)
+                u_map = u_map_raw.clone()
+    
             train_frac = self.cfg['mapping']['uncertainty_params']['train_frac_fix']
 
             h = self.images.shape[2]
             w = self.images.shape[3]
-            uncer = torch.clip(uncer, min=0.1) + 1e-3
-
-
-
-            uncer = uncer.unsqueeze(1)
-            uncer = F.interpolate(uncer, size=(h, w), mode="bilinear").squeeze(1).detach()
+            
+            u_map = torch.clip(u_map, min=0.1) + 1e-3
+            u_map = u_map.unsqueeze(1)
+            u_map = F.interpolate(u_map, size=(h, w), mode="bilinear", align_corners=False).squeeze(1).detach()
             data_rate = 1 + 1 * map_utils.compute_bias_factor(train_frac, 0.8)
-            uncer = uncer[:, self.slice_h, self.slice_w]
-            uncer = (uncer - 0.1) * data_rate + 0.1
-
-            self.uncertainties_inv[i*20:min((i+1)*20,self.counter.value),:,:] = torch.clamp(0.5/uncer**2, 0.0, 1.0)
+            u_map = u_map[:, self.slice_h, self.slice_w]
+            u_map = (u_map - 0.1) * data_rate + 0.1
+            self.mapping_uncertainties_inv[batch,:,:] = torch.clamp(0.5/u_map**2, 0.0, 1.0)
+        
 
             i += 1
 
@@ -545,23 +793,29 @@ class DepthVideo:
             raise Exception('This function should not be called if uncertainty aware is not activated')
 
         dino_feat_batch = self.dino_feats[idxs,:,:,:].to(self.device)
+        
         with Lock():
-            _, uncer, _ = self.uncer_network(dino_feat_batch)
+            u_map_raw, _ = self.uncer_network(dino_feat_batch)
+            u_map = u_map_raw.clone()
+
         train_frac = self.cfg['mapping']['uncertainty_params']['train_frac_fix']
 
         h = self.images.shape[2]
         w = self.images.shape[3]
-        uncer = torch.clip(uncer, min=0.1) + 1e-3
+        u_map = torch.clip(u_map, min=0.1) + 1e-3
 
+        if u_map.dim() == 2:
+            u_map = u_map.unsqueeze(0)
 
-
-        uncer = uncer.unsqueeze(1)
-        uncer = torch.nn.functional.interpolate(uncer, size=(h, w), mode="bilinear").squeeze(1).detach()
+        u_map = u_map.unsqueeze(1)
+        u_map = F.interpolate(u_map, size=(h, w), mode="bilinear", align_corners=False).squeeze(1).detach()
         data_rate = 1 + 1 * map_utils.compute_bias_factor(train_frac, 0.8)
-        uncer = uncer[:, self.slice_h, self.slice_w]
-        uncer = (uncer - 0.1) * data_rate + 0.1
+        
+        u_map = u_map[:, self.slice_h, self.slice_w]
+        u_map = (u_map - 0.1) * data_rate + 0.1
 
-        self.uncertainties_inv[idxs,:,:] = torch.clamp(0.5/uncer**2, 0.0, 1.0)
+        self.mapping_uncertainties_inv[idxs,:,:] = torch.clamp(0.5/u_map**2, 0.0, 1.0)
+        
 
     def set_dirty(self,index_start, index_end):
         self.dirty[index_start:index_end] = True
@@ -583,7 +837,19 @@ class DepthVideo:
         depths = torch.stack(depths,dim=0).numpy()
         timestamps = torch.stack(timestamps,dim=0).numpy() 
         valid_depth_masks = torch.stack(valid_depth_masks,dim=0).numpy()       
-        np.savez(path,poses=poses,depths=depths,timestamps=timestamps,valid_depth_masks=valid_depth_masks)
+        
+        save_dict = {
+            "poses": poses,
+            "depths": depths,
+            "timestamps": timestamps,
+            "valid_depth_masks": valid_depth_masks
+        }
+        if self.uncertainty_aware:
+            self.update_all_uncertainty_mask()
+            save_dict["tracking_uncertainty"] = self.uncertainties_inv[:self.counter.value].cpu().numpy()
+            save_dict["mapping_uncertainty"] = self.mapping_uncertainties_inv[:self.counter.value].cpu().numpy()
+
+        np.savez(path, **save_dict)
         self.printer.print(f"Saved final depth video: {path}",FontColor.INFO)
 
 

@@ -76,6 +76,9 @@ class Frontend:
         else:
             cur_t = self.video.counter.value
             self.num_keyframes_dropped  = 0
+            # Signal SCE to run on the next BA call: a new keyframe was confirmed.
+            if self.cfg['tracking']['uncertainty_params']['activate'] and hasattr(self.video, '_sce_new_frame_pending'):
+                self.video._sce_new_frame_pending = True
             if self.enable_loop and cur_t > self.frontend_window:
                 n_kf, n_edge = self.loop_closing.loop_ba(t_start=0, t_end=cur_t, steps=self.iters2, 
                                                          motion_only=False, local_graph=self.graph,
@@ -124,6 +127,8 @@ class Frontend:
 
         with self.video.get_lock():
             self.video.set_dirty(0, self.t1)
+            if hasattr(self.video, 'is_initialized'):
+                self.video.is_initialized = True
 
         self.graph.rm_factors(self.graph.ii < self.warmup-4, store=True)
 
@@ -155,6 +160,8 @@ class Frontend:
 
         with self.video.get_lock():
             self.video.set_dirty(0, self.t1)
+            if hasattr(self.video, 'is_initialized_fully'):
+                self.video.is_initialized_fully = True
 
         self.graph.rm_factors(self.graph.ii < self.warmup-4, store=True)
 

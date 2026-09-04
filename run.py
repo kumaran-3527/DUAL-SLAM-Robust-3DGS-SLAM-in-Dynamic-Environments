@@ -25,7 +25,8 @@ if __name__ == '__main__':
     torch.multiprocessing.set_start_method('spawn')
 
     cfg = config.load_config(args.config)
-    setup_seed(cfg['setup_seed'])
+    if 'setup_seed' in cfg:
+        setup_seed(cfg['setup_seed'])
     if cfg['fast_mode']:
         # Force the final refine iterations to be 3000 if in fast mode
         cfg['mapping']['final_refine_iters'] = 3000
