@@ -3,8 +3,8 @@
   <h1 align="center">DUAL-SLAM: Robust 3DGS SLAM in Dynamic Environments</h1>
   <h3 align="center">Supplementary Code for Anonymous Submission</h3>
 
-Given a monocular video sequence captured in the wild with dynamic distractors,
-DUAL-SLAM accurately tracks the camera trajectory and reconstructs a 3D Gaussian map for static elements, effectively removing all dynamic components. 
+Given a monocular video sequence captured in the wild with dynamic objects,
+DUAL-SLAM accurately tracks the camera trajectory and reconstructs an artifact-free static 3DGS scene, effectively removing all dynamic elements. 
 </p>
 <br>
 
