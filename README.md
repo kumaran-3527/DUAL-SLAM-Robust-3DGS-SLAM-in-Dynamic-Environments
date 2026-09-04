@@ -8,7 +8,13 @@ DUAL-SLAM accurately tracks the camera trajectory and reconstructs an artifact-f
 </p>
 <br>
 
-
+<p align="center">
+  <a href="https://youtu.be/tVIznDi280c">
+    <img src="https://img.youtube.com/vi/tVIznDi280c/maxresdefault.jpg" alt="DUAL-SLAM Video Demonstration" width="80%">
+  </a>
+  <br>
+  <a href="https://youtu.be/tVIznDi280c">▶️ <b>Watch the Full Video Demonstration</b></a>
+</p>
 
 <br>
 <!-- TABLE OF CONTENTS -->
