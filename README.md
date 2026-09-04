@@ -180,4 +180,4 @@ python scripts_run/summarize_pose_eval.py
 ```
 
 ## Acknowledgement
-We adapted some codes from some awesome repositories including [WildGS-SLAM](https://github.com/GradientSpaces/WildGS-SLAM), [SAM3](https://github.com/facebookresearch/sam3), and [DROID-W](https://github.com/MoyangLi00/DROID-W]. Thanks for making codes publicly available.
+We adapted some codes from some awesome repositories including [WildGS-SLAM](https://github.com/GradientSpaces/WildGS-SLAM), [SAM3](https://github.com/facebookresearch/sam3), and [DROID-W](https://github.com/MoyangLi00/DROID-W). Thanks for making codes publicly available.
